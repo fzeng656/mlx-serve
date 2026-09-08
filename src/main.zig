@@ -356,6 +356,10 @@ fn printUsage(io: std.Io) void {
         \\  --lan-name <name>   Bonjour instance name for --lan-share
         \\                        (default: this Mac's hostname).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
+        \\  --ds4-mode          DS4-style long-agent runtime preset: pins the
+        \\                      default model resident, enables compact console,
+        \\                      12GB RAM prefix cache + 128GB SSD persistence.
+        \\                      Explicit cache/residency flags override sizes.
         \\  --compact-log       DS4-style console: ready/perf/warn/error only;
         \\                      full info still goes to --log-file.
         \\  --log-file <path>   Persist the server log ("off" disables).
@@ -519,9 +523,15 @@ pub fn main(init: std.process.Init) !void {
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
+    var max_resident_models_explicit: bool = false;
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
     var max_resident_mem_explicit: bool = false;
+    var max_resident_mem_arg_seen: bool = false;
     var idle_evict_secs: ?u32 = null;
+    var ds4_mode: bool = false;
+    var prefix_cache_entries_explicit: bool = false;
+    var prefix_cache_mem_explicit: bool = false;
+    var prefix_cache_disk_explicit: bool = false;
     var metrics_enabled = false;
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
@@ -728,6 +738,8 @@ pub fn main(init: std.process.Init) !void {
                 log.setLevel(level);
                 log_level_explicit = true;
             }
+        } else if (std.mem.eql(u8, args[i], "--ds4-mode")) {
+            ds4_mode = true;
         } else if (std.mem.eql(u8, args[i], "--compact-log")) {
             log.setCompactConsole(true);
         } else if (std.mem.eql(u8, args[i], "--log-file") and i + 1 < args.len) {
@@ -752,6 +764,7 @@ pub fn main(init: std.process.Init) !void {
             generate_mod.prefill_trace_force = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
+            prefix_cache_entries_explicit = true;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and i + 1 < args.len) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
@@ -759,6 +772,7 @@ pub fn main(init: std.process.Init) !void {
             // insensitive), or `0`/`off` to disable the byte budget entirely
             // (count cap from --prefix-cache-entries still applies).
             i += 1;
+            prefix_cache_mem_explicit = true;
             server_mod.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
@@ -769,6 +783,7 @@ pub fn main(init: std.process.Init) !void {
             // and RAM evictions instead of recomputed. Byte budget with the
             // same size grammar as --prefix-cache-mem; `0`/`off` disables.
             i += 1;
+            prefix_cache_disk_explicit = true;
             server_mod.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
@@ -834,9 +849,11 @@ pub fn main(init: std.process.Init) !void {
             // Plan 05 Phase D: cap on .ready entries in the registry.
             // ensureLoaded evicts LRU before loading when this would be exceeded.
             i += 1;
+            max_resident_models_explicit = true;
             max_resident_models = std.fmt.parseInt(u32, args[i], 10) catch 3;
             if (max_resident_models == 0) max_resident_models = 1;
         } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and i + 1 < args.len) {
+            max_resident_mem_arg_seen = true;
             // Plan 05 Phase D: cap on summed resident bytes. Accepts the
             // same suffixes as --prefix-cache-mem. Special string "auto"
             // (or default 0) → 80% of mlx_set_wired_limit at server start.
@@ -915,6 +932,28 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // DS4-style long-agent preset. The cache sizes are defaults, not hard
+    // requirements: explicit CLI cache/residency flags keep operator control.
+    // The semantic parts are forced: compact console, no idle model eviction,
+    // and a default-model pin so registry LRU cannot destroy the active runtime.
+    if (ds4_mode) {
+        log.setCompactConsole(true);
+        model_registry_mod.pin_default_model_on_init = true;
+        idle_evict_secs = null;
+        if (!prefix_cache_entries_explicit) server_mod.prefix_cache_capacity = 32;
+        if (!prefix_cache_mem_explicit) server_mod.prefix_cache_mem_bytes = 12 * 1024 * 1024 * 1024;
+        if (!prefix_cache_disk_explicit) server_mod.prefix_cache_disk_bytes = 128 * 1024 * 1024 * 1024;
+        if (!max_resident_models_explicit) max_resident_models = 1;
+        if (!max_resident_mem_arg_seen) {
+            // 0 + explicit means no registry byte cap. Model preflight and the
+            // MLX wired-limit guard still protect the machine from OOM.
+            max_resident_mem = 0;
+            max_resident_mem_explicit = true;
+        }
+    } else {
+        model_registry_mod.pin_default_model_on_init = false;
+    }
+
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
     // so every pulled model is loadable by name (Ollama-style).
@@ -968,6 +1007,12 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
+    if (ds4_mode) {
+        log.status("DS4 mode · model pinned · RAM cache {d:.0}MB · SSD cache {d:.0}GB\n", .{
+            @as(f64, @floatFromInt(server_mod.prefix_cache_mem_bytes)) / (1024.0 * 1024.0),
+            @as(f64, @floatFromInt(server_mod.prefix_cache_disk_bytes)) / (1024.0 * 1024.0 * 1024.0),
+        });
+    }
 
     // Plan 05 Phase 1: model discovery. When --model-dir is passed, scan
     // the directory for subdirectories containing config.json. The

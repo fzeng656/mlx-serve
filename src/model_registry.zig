@@ -35,6 +35,9 @@ const log = @import("log.zig");
 
 /// Bumped every time a model becomes `.ready`; readers compare against the value they last acted on.
 pub var load_generation = std.atomic.Value(u64).init(0);
+/// Process-wide preset hook used by --ds4-mode. Kept false by default so
+/// normal multi-model servers retain the upstream eviction policy.
+pub var pin_default_model_on_init: bool = false;
 
 const Transformer = transformer_mod.Transformer;
 const Weights = model_mod.Weights;
@@ -535,6 +538,11 @@ pub const ModelRegistry = struct {
     /// entry's `id`; valid for the registry's lifetime.
     default_id: []const u8,
 
+    /// DS4-style single-runtime pin: when enabled the current default model
+    /// is never selected by automatic LRU eviction. Explicit unload remains
+    /// allowed. This keeps model residency stable across long agent sessions.
+    pin_default_model: bool = false,
+
     /// Cap on `.ready` entries. ensureLoaded evicts before exceeding.
     max_resident_models: u32,
     /// Cap on summed bytes_resident across `.ready` entries.
@@ -589,6 +597,7 @@ pub const ModelRegistry = struct {
             .discovery = discovery,
             .entries = std.StringHashMap(*LoadedModel).init(allocator),
             .default_id = "",
+            .pin_default_model = pin_default_model_on_init,
             .max_resident_models = if (max_resident_models == 0) 1 else max_resident_models,
             .max_resident_mem = max_resident_mem,
             .idle_evict_secs = idle_evict_secs,
@@ -738,6 +747,14 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         const entry = self.entries.get(id) orelse return error.UnknownModelId;
         self.default_id = entry.id;
+    }
+
+    /// Pin/unpin the default model against automatic registry LRU eviction.
+    /// Explicit unload requests are intentionally unaffected.
+    pub fn setPinDefaultModel(self: *ModelRegistry, enabled: bool) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.pin_default_model = enabled;
     }
 
     /// Look up an entry by its on-disk path (trailing slashes ignored).
@@ -963,6 +980,7 @@ pub const ModelRegistry = struct {
             if (entry.state != .ready) continue;
             if (entry.refcount.load(.acquire) != 0) continue;
             if (std.mem.eql(u8, entry.id, exclude_id)) continue;
+            if (self.pin_default_model and self.default_id.len > 0 and std.mem.eql(u8, entry.id, self.default_id)) continue;
             if (entry.last_used_ns < best_used) {
                 best_used = entry.last_used_ns;
                 best = entry;
@@ -1284,6 +1302,21 @@ test "ModelRegistry: registerByPath rejects a nonexistent directory" {
     defer reg.deinit();
     try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model"));
     try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/"));
+}
+
+test "ModelRegistry: DS4 pin keeps default out of automatic LRU eviction" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    _ = try makeReadyStub(reg, "b", 10);
+    try reg.setDefault("a");
+    reg.setPinDefaultModel(true);
+    reg.mutex.lockUncancelable(reg.io);
+    const victim = reg.pickLruEvictable("");
+    reg.mutex.unlock(reg.io);
+    try testing.expect(victim != null);
+    try testing.expectEqualStrings("b", victim.?.id);
+    try testing.expectEqual(LoadState.ready, a.state);
 }
 
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {
