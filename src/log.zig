@@ -206,6 +206,15 @@ fn writeToSink(bytes: []const u8) void {
 ///
 /// Flip it locally (see the file-sink test) when a test must assert on logging.
 var stderr_enabled: bool = !builtin.is_test;
+var compact_console: bool = false;
+
+pub fn setCompactConsole(enabled_: bool) void {
+    compact_console = enabled_;
+}
+
+pub fn isCompactConsole() bool {
+    return compact_console;
+}
 
 /// Env-gated live-test harnesses (generation runs driven through the test
 /// binary) opt back into stderr logging: the phase/step lines ARE the
@@ -215,8 +224,8 @@ pub fn enableStderr() void {
 }
 
 /// Format once, fan out to stderr and (when open) the file.
-fn emit(comptime fmt: []const u8, args: anytype) void {
-    if (stderr_enabled) std.debug.print(fmt, args);
+fn emitWithConsole(comptime fmt: []const u8, args: anytype, console: bool) void {
+    if (stderr_enabled and console) std.debug.print(fmt, args);
     if (!@atomicLoad(bool, &sink_active, .acquire)) return;
 
     var buf: [line_buf_len]u8 = undefined;
@@ -235,25 +244,33 @@ fn emit(comptime fmt: []const u8, args: anytype) void {
 
 pub fn info(comptime fmt: []const u8, args: anytype) void {
     if (@intFromEnum(current_level) >= @intFromEnum(Level.info)) {
-        emit(fmt, args);
+        emitWithConsole(fmt, args, !compact_console);
+    }
+}
+
+/// Info-level line that remains visible on stderr in compact-console mode.
+/// It is still copied to the persistent log file like every other info line.
+pub fn status(comptime fmt: []const u8, args: anytype) void {
+    if (@intFromEnum(current_level) >= @intFromEnum(Level.info)) {
+        emitWithConsole(fmt, args, true);
     }
 }
 
 pub fn warn(comptime fmt: []const u8, args: anytype) void {
     if (@intFromEnum(current_level) >= @intFromEnum(Level.warn)) {
-        emit(fmt, args);
+        emitWithConsole(fmt, args, true);
     }
 }
 
 pub fn err(comptime fmt: []const u8, args: anytype) void {
     if (@intFromEnum(current_level) >= @intFromEnum(Level.err)) {
-        emit(fmt, args);
+        emitWithConsole(fmt, args, true);
     }
 }
 
 pub fn debug(comptime fmt: []const u8, args: anytype) void {
     if (@intFromEnum(current_level) >= @intFromEnum(Level.debug)) {
-        emit(fmt, args);
+        emitWithConsole(fmt, args, !compact_console);
     }
 }
 
@@ -264,7 +281,7 @@ pub fn enabled(level: Level) bool {
 
 /// `info`/`debug`/`warn` with the level chosen at runtime.
 pub fn atLevel(level: Level, comptime fmt: []const u8, args: anytype) void {
-    if (enabled(level)) emit(fmt, args);
+    if (enabled(level)) emitWithConsole(fmt, args, if (level == .warn or level == .err) true else !compact_console);
 }
 
 // ── Tests ──

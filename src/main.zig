@@ -356,6 +356,8 @@ fn printUsage(io: std.Io) void {
         \\  --lan-name <name>   Bonjour instance name for --lan-share
         \\                        (default: this Mac's hostname).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
+        \\  --compact-log       DS4-style console: ready/perf/warn/error only;
+        \\                      full info still goes to --log-file.
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
         \\  --version           Print version and exit
@@ -726,6 +728,8 @@ pub fn main(init: std.process.Init) !void {
                 log.setLevel(level);
                 log_level_explicit = true;
             }
+        } else if (std.mem.eql(u8, args[i], "--compact-log")) {
+            log.setCompactConsole(true);
         } else if (std.mem.eql(u8, args[i], "--log-file") and i + 1 < args.len) {
             i += 1;
             log_file_arg = args[i];

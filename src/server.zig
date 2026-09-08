@@ -1576,6 +1576,12 @@ pub fn serve(
         log.info("MTP context ceiling: {d} tokens (--max-mtp-ctx; requests past it decode serially)\n", .{generate_mod.max_mtp_ctx});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
+    if (log.isCompactConsole()) {
+        const cache_mb: f64 = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
+        log.status("mlx-serve ready · {s} · http://{s}:{d} · ctx {d} · cache {d}/{d:.0}MB\n", .{
+            config.model_type, host, port, pinned, prefix_cache_capacity, cache_mb,
+        });
+    }
     if (g_api_key != null) {
         log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health stays open)\n", .{});
     }
@@ -6888,7 +6894,7 @@ fn handleEmbeddings(
     try resp_buf.appendSlice(allocator, "}}");
 
     try sendResponse(stream, "200 OK", "application/json", resp_buf.items);
-    log.info("  <- {d} embeddings ({d} tokens)\n", .{ texts.items.len, total_tokens });
+    log.status("  <- {d} embeddings ({d} tokens)\n", .{ texts.items.len, total_tokens });
 }
 
 /// OpenAI `dimensions` semantics (text-embedding-3 class): keep the first
@@ -8317,7 +8323,7 @@ fn handleNonStreamingCompletion(
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
-    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+    log.status("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
@@ -8561,7 +8567,7 @@ fn handleStreamingCompletion(
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
-    log.info("  <- {d}+{d} tokens streamed ({d}ms) [{s}] [{s}]\n", .{
+    log.status("  <- {d}+{d} tokens streamed ({d}ms) [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 }
@@ -8838,7 +8844,7 @@ fn handleNonStreamingGeneration(
 
             var tc_perf_buf: [160]u8 = undefined;
             const tc_perf = formatPerfBracket(&tc_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
-            log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_calls: {d}]\n", .{
+            log.status("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_calls: {d}]\n", .{
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tc_perf, tool_calls.len,
             });
 
@@ -8909,7 +8915,7 @@ fn handleNonStreamingGeneration(
 
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
-    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+    log.status("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
@@ -10216,7 +10222,7 @@ fn handleStreamingGeneration(
     // populated in finalize); the bracket reports compute + any prefix reuse.
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
-    log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
+    log.status("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, finish_reason,
     });
 }
@@ -14663,7 +14669,7 @@ fn handleAnthropicNonStreaming(
 
             var tu_perf_buf: [160]u8 = undefined;
             const tu_perf = formatPerfBracket(&tu_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
-            log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
+            log.status("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_calls.len,
             });
 
@@ -14715,7 +14721,7 @@ fn handleAnthropicNonStreaming(
     defer if (echo_stop_seq) allocator.free(stop_seq_json);
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
-    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+    log.status("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, stop_reason,
     });
 
@@ -15538,7 +15544,7 @@ fn handleAnthropicStreaming(
 
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
-    log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
+    log.status("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, stop_reason,
     });
 }
@@ -16572,7 +16578,7 @@ fn handleResponsesInner(
             // Peer disconnected mid-decode. We've already cancelled the slot;
             // tear down without spending more I/O on terminal envelope events
             // (which would just fail or pile into a dead socket buffer).
-            log.info("  <- {d}+{d} tokens streamed [client_disconnect]\n", .{ ts.prompt_tokens, ts.completion_tokens });
+            log.status("  <- {d}+{d} tokens streamed [client_disconnect]\n", .{ ts.prompt_tokens, ts.completion_tokens });
             return;
         }
 
