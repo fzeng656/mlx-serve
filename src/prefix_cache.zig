@@ -1795,15 +1795,14 @@ pub const HotPrefixCache = struct {
             return .{ .ok = eff_tokens.len };
         }
 
-        while (self.entries.items.len >= self.max_entries) {
-            self.evictOneLru("count cap", cache_key);
-        }
-        if (self.max_kv_bytes > 0) {
-            while (self.current_kv_bytes + new_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-                self.evictOneLru("byte budget", cache_key);
-            }
-        }
-
+        // Admit first, THEN choose the victim.  Pre-evicting here makes the
+        // incoming workload invisible to the policy: with one established
+        // 100k agent entry and a first-time 30k worker, the only resident
+        // candidate is the agent, so even reuse-aware ranking has no choice
+        // but to destroy it.  The incoming snapshot already exists at this
+        // point (commit only transfers ownership/refcounts), so temporarily
+        // exceeding the accounting cap does not allocate another model-sized
+        // buffer.  Once appended, fair eviction can reject the newcomer itself.
         self.entries.append(self.allocator, .{
             .tokens = tokens_owned,
             .has_tools = has_tools,
@@ -1833,8 +1832,12 @@ pub const HotPrefixCache = struct {
             return err;
         };
         self.current_kv_bytes += new_bytes;
-        // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
-        if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
+
+        // Now the incoming entry participates in workload/reuse/size ranking.
+        // It is valid for this enforcement to evict the entry we just appended:
+        // that means cache admission was declined while generation itself
+        // remains successful.
+        self.enforceCapsAfterAppend();
         if (self.disk != null) self.disk_dirty = true;
         self.logResident();
         return .{ .ok = eff_tokens.len };
@@ -2401,6 +2404,26 @@ pub const HotPrefixCache = struct {
         }
         self.shedCheckpointsToFit();
         self.logResident();
+    }
+
+    /// Enforce count/byte caps AFTER a newcomer has been appended so the
+    /// newcomer itself is a valid eviction candidate.  This is cache admission,
+    /// not generation admission: rejecting a one-shot worker here must never
+    /// destroy a more valuable long-running agent session just because the
+    /// worker arrived second.
+    fn enforceCapsAfterAppend(self: *HotPrefixCache) void {
+        while (self.entries.items.len > self.max_entries and self.entries.items.len > 0) {
+            self.evictOneLru("count cap", null);
+        }
+        if (self.max_kv_bytes == 0) return;
+        while (self.current_kv_bytes > self.max_kv_bytes and self.entries.items.len > 1) {
+            self.evictOneLru("byte budget", null);
+        }
+        // A sole oversize entry may fit after dropping optional SSM checkpoints.
+        self.shedCheckpointsToFit();
+        while (self.current_kv_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
+            self.evictOneLru("byte budget", null);
+        }
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
@@ -6833,4 +6856,46 @@ test "HotPrefixCache: equal-size workload tie protects a reused long agent sessi
     // A single workload remains exactly plain LRU, preserving #378 semantics.
     for (cache.entries.items) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
+}
+
+test "HotPrefixCache: first-time worker is rejected after append instead of evicting reused main" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    cache.max_kv_bytes = 4096;
+
+    const main_key: u64 = 0xa;
+    const worker_key: u64 = 0xb;
+    const main_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const worker_tokens = [_]u32{ 90, 91 };
+
+    try cache.entries.append(testing.allocator, .{
+        .tokens = try testing.allocator.dupe(u32, &main_tokens),
+        .has_tools = false,
+        .cache_key = main_key,
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .last_used = 1,
+        .reuse_hits = 4,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = 3500,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+    try cache.entries.append(testing.allocator, .{
+        .tokens = try testing.allocator.dupe(u32, &worker_tokens),
+        .has_tools = false,
+        .cache_key = worker_key,
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .last_used = 2,
+        .reuse_hits = 0,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = 1200,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+    cache.current_kv_bytes = 4700;
+
+    cache.enforceCapsAfterAppend();
+    try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try testing.expectEqual(main_key, cache.entries.items[0].cache_key);
+    try testing.expectEqual(@as(u64, 3500), cache.current_kv_bytes);
 }
