@@ -1407,6 +1407,23 @@ pub fn serve(
     defer if (sampler_thread) |t| t.join();
     defer sampler_stop.store(true, .monotonic);
 
+    // File-backed expert idle reclaimer. Unlike model eviction this keeps the
+    // model logically loaded; it only madvise(DONTNEED)s clean mmap pages after
+    // a quiet period. Default 30s; 0 disables. The thread is cheap/no-op for
+    // ordinary models with no mmap-backed expert shards.
+    var mmap_reclaim_thread: ?std.Thread = null;
+    var mmap_reclaim_stop = std.atomic.Value(bool).init(false);
+    const mmap_idle_secs: u64 = blk: {
+        const raw_c = std.c.getenv("MLX_SERVE_MMAP_IDLE_SECS") orelse break :blk 30;
+        break :blk std.fmt.parseInt(u64, std.mem.span(raw_c), 10) catch 30;
+    };
+    if (mmap_idle_secs > 0) {
+        const ctx = MmapReclaimCtx{ .registry = scheduler.registry, .stop = &mmap_reclaim_stop, .idle_ns = @intCast(mmap_idle_secs * std.time.ns_per_s) };
+        mmap_reclaim_thread = try std.Thread.spawn(.{}, mmapReclaimLoop, .{ctx});
+    }
+    defer if (mmap_reclaim_thread) |t| t.join();
+    defer mmap_reclaim_stop.store(true, .monotonic);
+
     global_registry = scheduler.registry;
     defer global_registry = null;
 
@@ -10621,6 +10638,23 @@ fn logHttpBody(label: []const u8, body: []const u8) void {
     log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
 }
 
+const MmapReclaimCtx = struct {
+    registry: *model_registry_mod.ModelRegistry,
+    stop: *std.atomic.Value(bool),
+    idle_ns: i64,
+};
+
+fn mmapReclaimLoop(ctx: MmapReclaimCtx) void {
+    // 500ms polling keeps the test/debug threshold precise enough while adding
+    // no work to the inference thread. Production default is 30s.
+    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    while (!ctx.stop.load(.monotonic)) {
+        _ = std.c.nanosleep(&poll_ts, null);
+        if (ctx.stop.load(.monotonic)) break;
+        _ = ctx.registry.reclaimIdleMmapPages(ctx.idle_ns);
+    }
+}
+
 const GaugeSamplerCtx = struct {
     metrics: *instr.Metrics,
     scheduler: *scheduler_mod.Scheduler,
@@ -18316,7 +18350,6 @@ test "a warm append is billed the rows it ALLOCATES, not the rows it already hol
     try t.expectEqual(@as(u64, 0), cold.shared_resident_bytes);
     try t.expectEqual(@as(u64, 0), cold.grow_coexist_bytes);
 }
-
 
 test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker OOM)" {
     const GB: u64 = 1 << 30;

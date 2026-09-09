@@ -1678,7 +1678,7 @@ fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_
             const p = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, sh });
             const pz = try allocator.dupeSentinel(u8, p, 0);
             defer allocator.free(pz);
-            try model_mod.loadSafetensorsFile(allocator, &weights, pz, s, false);
+            try model_mod.loadSafetensorsFile(null, allocator, &weights, pz, s, false);
         }
         return weights;
     }

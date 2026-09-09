@@ -3425,15 +3425,42 @@ fn jsonFloat(v: std.json.Value) f32 {
     };
 }
 
+/// DS4-mode routed-expert mmap policy. `policy` is process-wide (set by
+/// --ds4-mode); `on_load` is scoped by the inference thread to the CURRENT
+/// checkpoint after checking its config is qwen4_exp. Keeping those separate
+/// prevents a later multi-model cold load from inheriting Qwen4's switch_mlp
+/// policy merely because the launch model happened to be Qwen4.
+pub var mmap_routed_experts_policy: bool = false;
+pub var mmap_routed_experts_on_load: bool = false;
+
+pub fn mmapRoutedExpertsPolicyEnabled() bool {
+    if (!mmap_routed_experts_policy) return false;
+    if (std.c.getenv("MLX_SERVE_MMAP_EXPERTS")) |p|
+        return !std.mem.eql(u8, std.mem.span(p), "0");
+    return true;
+}
+
+fn mmapRoutedExpertsEnabled() bool {
+    return mmap_routed_experts_on_load and mmapRoutedExpertsPolicyEnabled();
+}
+
+fn isMmapRoutedExpertKey(key: []const u8) bool {
+    return std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null;
+}
+
 /// Holds all loaded weights as mlx arrays, keyed by name.
 pub const Weights = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
+    mmap_shards: std.ArrayList(*mlx.msv_mmap_shard),
+    mmap_tensor_count: usize = 0,
+    mmap_tensor_bytes: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Weights {
         return .{
             .map = std.StringHashMap(mlx.mlx_array).init(allocator),
             .allocator = allocator,
+            .mmap_shards = .empty,
         };
     }
 
@@ -3444,6 +3471,16 @@ pub const Weights = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.map.deinit();
+        for (self.mmap_shards.items) |shard| mlx.msv_mmap_shard_close(shard);
+        self.mmap_shards.deinit(self.allocator);
+    }
+
+    /// Drop clean file-backed model pages while keeping every MLX/Metal handle
+    /// alive. A later kernel access faults the pages back from the model file.
+    pub fn dropMmapPages(self: *Weights) void {
+        for (self.mmap_shards.items) |shard| {
+            _ = mlx.msv_mmap_shard_dontneed(shard, 0, 0);
+        }
     }
 
     pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
@@ -3523,7 +3560,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
 
     const pathz = try allocator.dupeSentinel(u8, abs_path, 0);
     defer allocator.free(pathz);
-    try loadSafetensorsFile(allocator, &weights, pathz, s, false);
+    try loadSafetensorsFile(null, allocator, &weights, pathz, s, false);
 
     if (weights.count() == 0) {
         log.err("no usable weights loaded from {s} — corrupt or empty safetensors file?\n", .{abs_path});
@@ -3579,7 +3616,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s, load_vision);
+        try loadSafetensorsFile(io, allocator, &weights, path, s, load_vision);
         file_count += 1;
     }
 
@@ -3597,6 +3634,13 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     }
 
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
+    if (weights.mmap_tensor_count > 0) {
+        log.info("[mmap] routed experts: {d} tensors, {d:.2} GB file-backed across {d} shard(s)\n", .{
+            weights.mmap_tensor_count,
+            @as(f64, @floatFromInt(weights.mmap_tensor_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            weights.mmap_shards.items.len,
+        });
+    }
     reportF16Narrowing();
     return weights;
 }
@@ -3660,7 +3704,87 @@ pub fn reportF16Narrowing() void {
     narrowed_1d = 0;
 }
 
+const MmapSafetensorsHeader = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    data_base: usize,
+
+    fn deinit(self: *MmapSafetensorsHeader) void {
+        self.parsed.deinit();
+    }
+
+    fn absoluteOffset(self: *const MmapSafetensorsHeader, key: []const u8) ?usize {
+        if (self.parsed.value != .object) return null;
+        const rec = self.parsed.value.object.get(key) orelse return null;
+        if (rec != .object) return null;
+        const offs = rec.object.get("data_offsets") orelse return null;
+        if (offs != .array or offs.array.items.len != 2) return null;
+        const first = offs.array.items[0];
+        if (first != .integer or first.integer < 0) return null;
+        const rel: usize = @intCast(first.integer);
+        if (rel > std.math.maxInt(usize) - self.data_base) return null;
+        return self.data_base + rel;
+    }
+};
+
+fn readMmapSafetensorsHeader(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !MmapSafetensorsHeader {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const header_len_u64 = try rs.interface.takeInt(u64, .little);
+    if (header_len_u64 == 0 or header_len_u64 > 100_000_000) return error.InvalidSafetensorsHeader;
+    const header_len: usize = @intCast(header_len_u64);
+    const header = try allocator.alloc(u8, header_len);
+    defer allocator.free(header);
+    try rs.interface.readSliceAll(header);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, header, .{});
+    return .{ .parsed = parsed, .data_base = 8 + header_len };
+}
+
+/// Exact bytes that the Qwen4 mmap lane will keep file-backed, derived only
+/// from safetensors headers. Used by the load preflight before any MLX array is
+/// created, so the guard bills anonymous/resident weights rather than pretending
+/// every mapped expert must fit in RAM simultaneously. Returns 0 on malformed /
+/// unavailable metadata, which makes the caller fall back to the old conservative
+/// full-weight preflight.
+pub fn estimateMmapRoutedExpertBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) u64 {
+    if (!mmapRoutedExpertsPolicyEnabled()) return 0;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var referenced = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+
+    var total: u64 = 0;
+    var saw_any = false;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, entry.name }) catch return 0;
+        defer allocator.free(path);
+        var h = readMmapSafetensorsHeader(io, allocator, path) catch return 0;
+        defer h.deinit();
+        if (h.parsed.value != .object) return 0;
+        var hit = h.parsed.value.object.iterator();
+        while (hit.next()) |rec| {
+            if (!isMmapRoutedExpertKey(rec.key_ptr.*)) continue;
+            const v = rec.value_ptr.*;
+            if (v != .object) return 0;
+            const offs = v.object.get("data_offsets") orelse return 0;
+            if (offs != .array or offs.array.items.len != 2) return 0;
+            const a = offs.array.items[0];
+            const b = offs.array.items[1];
+            if (a != .integer or b != .integer or a.integer < 0 or b.integer < a.integer) return 0;
+            total +|= @intCast(b.integer - a.integer);
+            saw_any = true;
+        }
+    }
+    return if (saw_any) total else 0;
+}
+
 pub fn loadSafetensorsFile(
+    io_opt: ?std.Io,
     allocator: std.mem.Allocator,
     weights: *Weights,
     path: [*:0]const u8,
@@ -3674,6 +3798,22 @@ pub fn loadSafetensorsFile(
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
     try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
+
+    // MLX's stock safetensors load is lazy `pread -> allocator::malloc`. In
+    // DS4 mode we replace ONLY qwen4 routed-expert leaves with arrays sharing a
+    // read-only file mapping. Dense/GDN/QSA/PLE weights keep their stock path.
+    var mmap_header: ?MmapSafetensorsHeader = null;
+    defer if (mmap_header) |*h| h.deinit();
+    if (mmapRoutedExpertsEnabled()) {
+        if (io_opt) |io| {
+            mmap_header = readMmapSafetensorsHeader(io, allocator, std.mem.span(path)) catch |err| blk: {
+                log.warn("[mmap] safetensors header fallback for {s}: {s}\n", .{ std.mem.span(path), @errorName(err) });
+                break :blk null;
+            };
+        }
+    }
+    var mmap_shard: ?*mlx.msv_mmap_shard = null;
+    var mmap_file_disabled = false;
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
@@ -3693,6 +3833,38 @@ pub fn loadSafetensorsFile(
         if (!shouldKeepWeightKey(key_str, load_vision)) {
             _ = mlx.mlx_array_free(value);
             continue;
+        }
+
+        if (!mmap_file_disabled and isMmapRoutedExpertKey(key_str)) mmap_try: {
+            const h = &(mmap_header orelse break :mmap_try);
+            const abs_off = h.absoluteOffset(key_str) orelse break :mmap_try;
+            if (mmap_shard == null) {
+                var sh: *mlx.msv_mmap_shard = undefined;
+                if (mlx.msv_mmap_shard_open(&sh, path) != 0) {
+                    log.warn("[mmap] shard fallback for {s}: {s}\n", .{ std.mem.span(path), std.mem.span(mlx.msv_mmap_last_error()) });
+                    mmap_file_disabled = true;
+                    break :mmap_try;
+                }
+                weights.mmap_shards.append(allocator, sh) catch |err| {
+                    mlx.msv_mmap_shard_close(sh);
+                    return err;
+                };
+                mmap_shard = sh;
+            }
+            const ndim = mlx.mlx_array_ndim(value);
+            const shape = mlx.mlx_array_shape(value);
+            const dtype = mlx.mlx_array_dtype(value);
+            var mapped = mlx.mlx_array_new();
+            if (mlx.msv_mmap_shard_array(&mapped, mmap_shard.?, abs_off, shape, @intCast(ndim), dtype) != 0) {
+                _ = mlx.mlx_array_free(mapped);
+                log.warn("[mmap] tensor fallback {s}: {s}\n", .{ key_str, std.mem.span(mlx.msv_mmap_last_error()) });
+                mmap_file_disabled = true;
+                break :mmap_try;
+            }
+            _ = mlx.mlx_array_free(value);
+            value = mapped;
+            weights.mmap_tensor_count += 1;
+            weights.mmap_tensor_bytes += @as(u64, @intCast(mlx.mlx_array_size(mapped))) * @as(u64, @intCast(mlx.mlx_array_itemsize(mapped)));
         }
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's

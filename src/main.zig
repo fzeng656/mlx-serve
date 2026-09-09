@@ -938,6 +938,7 @@ pub fn main(init: std.process.Init) !void {
     // and a default-model pin so registry LRU cannot destroy the active runtime.
     if (ds4_mode) {
         log.setCompactConsole(true);
+        model_mod.mmap_routed_experts_policy = true;
         model_registry_mod.pin_default_model_on_init = true;
         idle_evict_secs = null;
         if (!prefix_cache_entries_explicit) server_mod.prefix_cache_capacity = 32;
@@ -951,6 +952,7 @@ pub fn main(init: std.process.Init) !void {
             max_resident_mem_explicit = true;
         }
     } else {
+        model_mod.mmap_routed_experts_policy = false;
         model_registry_mod.pin_default_model_on_init = false;
     }
 

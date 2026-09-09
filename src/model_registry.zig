@@ -239,6 +239,13 @@ pub const LoadedModel = struct {
     /// LRU eviction picks the lowest among `.ready` entries with
     /// refcount == 0.
     last_used_ns: i64,
+    /// Real monotonic time of the most recent completed request. Separate from
+    /// last_used_ns, which is an LRU sequence number rather than nanoseconds.
+    /// The mmap idle reclaimer uses this only while refcount == 0.
+    mmap_last_release_ns: i64 = 0,
+    /// True after the idle reclaimer advised away the clean file-backed expert
+    /// pages. The next completed request clears it, starting a new idle epoch.
+    mmap_pages_dropped: bool = false,
     /// Resident GPU bytes for this entry (weights + vision + drafter),
     /// summed at load time. Zero for non-`.ready` entries.
     bytes_resident: u64,
@@ -961,6 +968,8 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         self.lru_clock += 1;
         lm.last_used_ns = self.lru_clock;
+        lm.mmap_last_release_ns = @intCast(std.Io.Timestamp.now(self.io, .boot).nanoseconds);
+        lm.mmap_pages_dropped = false;
         const prev = lm.refcount.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
         // Broadcast so an evictor waiting for refcount == 0 wakes.
@@ -1000,6 +1009,8 @@ pub const ModelRegistry = struct {
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;
         entry.error_name = null;
+        entry.mmap_last_release_ns = @intCast(std.Io.Timestamp.now(self.io, .boot).nanoseconds);
+        entry.mmap_pages_dropped = false;
         self.lru_clock += 1;
         entry.last_used_ns = self.lru_clock;
         self.current_resident_bytes += bytes_resident;
@@ -1094,6 +1105,37 @@ pub const ModelRegistry = struct {
             out[n] = victim;
             n += 1;
         }
+    }
+
+    /// Advise away clean file-backed routed-expert pages for ready models that
+    /// have had no borrowed users for `idle_ns`. This never destroys MLX arrays
+    /// or Metal buffers: a later kernel access faults the pages back from SSD.
+    /// Safe off the inference thread because the operation is only POSIX
+    /// madvise over immutable MAP_PRIVATE mappings; no MLX API is called.
+    pub fn reclaimIdleMmapPages(self: *ModelRegistry, idle_ns: i64) usize {
+        if (idle_ns <= 0) return 0;
+        const now_ns: i64 = @intCast(std.Io.Timestamp.now(self.io, .boot).nanoseconds);
+        var dropped: usize = 0;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready or entry.refcount.load(.acquire) != 0) continue;
+            if (entry.mmap_pages_dropped or entry.mmap_last_release_ns <= 0) continue;
+            if (now_ns - entry.mmap_last_release_ns < idle_ns) continue;
+            const weights = entry.weights orelse continue;
+            if (weights.mmap_shards.items.len == 0) continue;
+            weights.dropMmapPages();
+            entry.mmap_pages_dropped = true;
+            dropped += 1;
+            log.info("[mmap] idle release: {s} dropped clean pages for {d} shard(s), {d:.2} GB mapped experts remain loaded\n", .{
+                entry.id,
+                weights.mmap_shards.items.len,
+                @as(f64, @floatFromInt(weights.mmap_tensor_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            });
+        }
+        return dropped;
     }
 
     /// Map a stored load-failure name back to the typed error `ensureLoaded`
@@ -1498,8 +1540,8 @@ test "ModelRegistry: snapshot places default first then most-recent" {
     defer testing.allocator.free(snap);
 
     try testing.expectEqual(@as(usize, 3), snap.len);
-    try testing.expectEqualStrings("b", snap[0].id);     // default first
-    try testing.expectEqualStrings("c", snap[1].id);     // most-recent of rest
+    try testing.expectEqualStrings("b", snap[0].id); // default first
+    try testing.expectEqualStrings("c", snap[1].id); // most-recent of rest
     try testing.expectEqualStrings("a", snap[2].id);
     try testing.expect(snap[0].loaded);
     try testing.expectEqual(@as(u64, 200), snap[0].bytes_resident);
