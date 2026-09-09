@@ -357,9 +357,11 @@ fn printUsage(io: std.Io) void {
         \\                        (default: this Mac's hostname).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --ds4-mode          DS4-style long-agent runtime preset: pins the
-        \\                      default model resident, enables compact console,
-        \\                      12GB RAM prefix cache + 128GB SSD persistence.
-        \\                      Explicit cache/residency flags override sizes.
+        \\                      default model, enables compact console, Qwen4
+        \\                      routed-expert mmap + idle page reclaim, 12GB RAM
+        \\                      prefix cache + 128GB SSD-first persistence and
+        \\                      restart restore. Explicit cache/residency flags
+        \\                      override sizes; env switches are debug kill switches.
         \\  --compact-log       DS4-style console: ready/perf/warn/error only;
         \\                      full info still goes to --log-file.
         \\  --log-file <path>   Persist the server log ("off" disables).
@@ -1010,7 +1012,12 @@ pub fn main(init: std.process.Init) !void {
     }
     defer log.closeFile();
     if (ds4_mode) {
-        log.status("DS4 mode · model pinned · RAM cache {d:.0}MB · SSD cache {d:.0}GB\n", .{
+        const mmap_note: []const u8 = if (model_mod.mmapRoutedExpertsPolicyEnabled())
+            "Qwen4 mmap+idle reclaim armed"
+        else
+            "Qwen4 mmap OFF";
+        log.status("DS4 mode · model pinned · {s} · RAM cache {d:.0}MB · SSD cache {d:.0}GB\n", .{
+            mmap_note,
             @as(f64, @floatFromInt(server_mod.prefix_cache_mem_bytes)) / (1024.0 * 1024.0),
             @as(f64, @floatFromInt(server_mod.prefix_cache_disk_bytes)) / (1024.0 * 1024.0 * 1024.0),
         });
