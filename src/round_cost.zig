@@ -18,6 +18,9 @@
 //! token per bucket. Kept out of the width grid (a serial tick is not a round), it answers
 //! the one question no width can: is speculation worth running here at all?
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const transformer_mod = @import("transformer.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
 pub const MAX_WIDTH: u32 = 16;
@@ -124,6 +127,11 @@ pub const Verdict = enum { folded, reseeded, contended, transition, bad_sample, 
 /// times the width-(w-1) round (measured steps run under 1.25x). Anything past
 /// it carried foreign work between round ends and would poison the planner.
 pub const IMPLAUSIBLE_STEP: f32 = 1.5;
+/// The mirror bound for the persisted sweep: a narrower round is strictly less work than a
+/// wider one, so a stored cell past this multiple of its nearest trusted WIDER cell carried
+/// foreign work. Width 1 has no narrower neighbour and only this bound reaches it (#382).
+/// Healthy tables reach 1.08x (M4 Max); a poisoned width-1 cell reads 1.6x to 2.1x.
+pub const IMPLAUSIBLE_WIDER: f32 = 1.25;
 /// A sample past this multiple of a mature cell's own value is the machine, not the round
 /// (another process on the GPU, #369). A stale cell is a regime change and reseeds instead.
 pub const SELF_SPIKE: f32 = 3.0;
@@ -223,15 +231,30 @@ pub const Table = struct {
         return false;
     }
 
-    /// Clear every width cell that fails the step bound against its narrower neighbour
-    /// (the persisted-table sweep); returns the count cleared.
+    /// `ms` at `width` exceeds IMPLAUSIBLE_WIDER over the nearest trusted wider cell. Sweep
+    /// only: at fold time a slower regime would have every narrower sample refused against a
+    /// stale wider cell, where the step bound alone still lets width 1 reseed the bucket.
+    fn widerImplausible(self: *const Table, width: u32, bucket: usize, ms: f32) bool {
+        var w = width;
+        while (w < MAX_WIDTH) {
+            w += 1;
+            const above = self.cells[w][bucket];
+            if (above.n < MIN_SAMPLES) continue;
+            return ms > above.ms * IMPLAUSIBLE_WIDER;
+        }
+        return false;
+    }
+
+    /// Clear every width cell that fails the step bound against its narrower neighbour or
+    /// the wider bound against its wider one (the persisted-table sweep); returns the count cleared.
     fn dropImplausibleCells(self: *Table) u32 {
         var dropped: u32 = 0;
         for (0..N_BUCKETS) |b| {
-            var w: u32 = 2;
+            var w: u32 = 1;
             while (w <= MAX_WIDTH) : (w += 1) {
                 const c = self.cells[w][b];
-                if (c.n == 0 or !self.stepImplausible(w, b, c.ms)) continue;
+                if (c.n == 0) continue;
+                if (!self.stepImplausible(w, b, c.ms) and !self.widerImplausible(w, b, c.ms)) continue;
                 self.cells[w][b] = .{};
                 dropped += 1;
             }
@@ -714,13 +737,12 @@ pub const WidthChooser = struct {
 
 // ── Persistence ──────────────────────────────────────────────────────────
 //
-// Every fresh boot otherwise pays the exploration again (measured: 3-4% on
-// whichever request carries a trial block, 22-round requests), while the
-// knowledge is per (chip, model, quant, OS build) and does not change
-// between boots. Stored under ~/.mlx-serve/round-cost/<key>.txt, restored
-// at load, written at the end of any request that folded new samples.
-// Stale version or unreadable content is a QUIET miss (the kv_disk_cache
-// discipline). `MLX_SERVE_ROUND_COST_PERSIST=0` disables both directions.
+// Knowledge is per (chip, model, quant, OS build, engine build): the same
+// binary across boots shares a table, a different binary never does.
+// Stored under ~/.mlx-serve/round-cost/<key>.txt, restored at load, written
+// at request end unless a barrier diagnostic is armed. Stale version or
+// unreadable content is a QUIET miss (the kv_disk_cache discipline).
+// `MLX_SERVE_ROUND_COST_PERSIST=0` disables both directions.
 
 /// v2 added the `serial` row; v3 split the top bucket (edges 64k/128k/256k). Bucket indices
 /// are the file's only spelling of "which context", so a stale version is a quiet miss.
@@ -740,16 +762,185 @@ pub fn totalFolded(t: *const Table) u32 {
     return t.folded +% t.serial_folded;
 }
 
+pub fn persistEnabledFrom(raw: ?[]const u8) bool {
+    const v = raw orelse return false;
+    return std.mem.eql(u8, v, "1");
+}
+
 pub fn persistEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(raw), "0");
+    const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST");
+    return persistEnabledFrom(if (raw) |r| std.mem.span(r) else null);
+}
+
+pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
+    for (raws) |raw| {
+        if (transformer_mod.diagEnvValueOn(raw)) return true;
+    }
+    return false;
+}
+
+fn qwen4ProfileArmed() bool {
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const s = std.mem.span(entry);
+        if (!std.mem.startsWith(u8, s, "QWEN4_PROFILE_")) continue;
+        const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
+        if (transformer_mod.diagEnvValueOn(@ptrCast(s[eq + 1 ..].ptr))) return true;
+    }
+    return false;
+}
+
+pub fn persistDiagArmed() bool {
+    return qwen4ProfileArmed() or
+        persistDiagArmedFrom(&.{
+            std.c.getenv("MLX_SERVE_MTP_TRACE"),
+            std.c.getenv("MLX_SERVE_MTP_FORCE_DEPTH"),
+        });
+}
+
+pub fn storeShouldWrite(persist_on: bool, diag_armed: bool, key_len: usize) bool {
+    return persist_on and !diag_armed and key_len != 0;
+}
+
+var build_id_buf: [64]u8 = undefined;
+var build_id_len: usize = 0;
+var build_id_mu: std.c.pthread_mutex_t = .{};
+
+pub fn engineBuildId() []const u8 {
+    _ = std.c.pthread_mutex_lock(&build_id_mu);
+    defer _ = std.c.pthread_mutex_unlock(&build_id_mu);
+    if (build_id_len != 0) return build_id_buf[0..build_id_len];
+    var h = std.hash.Fnv1a_64.init();
+    if (buildIdReadsExe(build_options.git_sha)) mixExeBytes(&h) else h.update(build_options.git_sha);
+    h.update("\x00");
+    mixMlxArtifacts(&h);
+    const printed = std.fmt.bufPrint(&build_id_buf, "{x:0>16}", .{h.final()}) catch build_id_buf[0..0];
+    build_id_len = printed.len;
+    return printed;
+}
+
+// A release build's sha stands for its bytes (the packager owns that promise); a dev build
+// has no sha and hashes the executable so an edit-and-rebuild never shares a table.
+pub fn buildIdReadsExe(git_sha: []const u8) bool {
+    return git_sha.len == 0;
+}
+
+fn mixExeBytes(h: *std.hash.Fnv1a_64) void {
+    var path_buf: [4096]u8 = undefined;
+    const path = exePath(&path_buf) orelse return;
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const got = std.c.read(fd, &buf, buf.len);
+        if (got < 0) {
+            const e = std.c._errno().*;
+            if (e == @backingInt(std.c.E.INTR)) continue;
+            break;
+        }
+        if (got == 0) break;
+        h.update(buf[0..@intCast(got)]);
+    }
+}
+
+fn exePath(buf: []u8) ?[:0]const u8 {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst => {
+            var n: u32 = @intCast(buf.len);
+            if (std.c._NSGetExecutablePath(buf.ptr, &n) != 0) return null;
+            return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(buf.ptr)), 0);
+        },
+        else => return null,
+    }
+}
+
+fn mixMlxArtifacts(h: *std.hash.Fnv1a_64) void {
+    var dylib_buf: [4096]u8 = undefined;
+    const dylib = mlxDylibPath(&dylib_buf) orelse return;
+    mixFileStamp(h, dylib);
+    var metal_buf: [4096]u8 = undefined;
+    const dir = std.fs.path.dirname(dylib) orelse return;
+    const metal = std.fmt.bufPrint(&metal_buf, "{s}/mlx.metallib", .{dir}) catch return;
+    mixFileStamp(h, metal);
+}
+
+fn mlxDylibPath(buf: []u8) ?[]const u8 {
+    if (builtin.os.tag.isDarwin()) {
+        const n = std.c._dyld_image_count();
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const name = std.mem.span(std.c._dyld_get_image_name(i));
+            if (std.mem.endsWith(u8, name, "libmlx.dylib")) return name;
+        }
+    }
+    var exe_buf: [4096]u8 = undefined;
+    const exe = exePath(&exe_buf) orelse return null;
+    const dir = std.fs.path.dirname(exe) orelse return null;
+    for ([_][]const u8{ "../../lib/mlx/lib/libmlx.dylib", "../../../lib/mlx/lib/libmlx.dylib" }) |rel| {
+        const p = std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, rel }) catch continue;
+        if (fileExists(p)) return p;
+    }
+    return null;
+}
+
+fn fileExists(path: []const u8) bool {
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return false;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return false;
+    _ = std.c.close(fd);
+    return true;
+}
+
+fn mixFileStamp(h: *std.hash.Fnv1a_64, path: []const u8) void {
+    const fp = fileFingerprint(path) orelse return;
+    h.update(std.mem.asBytes(&fp));
+}
+
+// Size plus six sampled 64 KiB windows: a byte-identical reinstall keeps its table (mtime is
+// not identity), a rebuilt dylib or metallib rotates it, and a 182 MB metallib costs 384 KiB.
+pub fn fileFingerprint(path: []const u8) ?u64 {
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return null;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(pbuf[0..path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return null;
+    const size: u64 = @intCast(@max(st.size, 0));
+    var h = std.hash.Fnv1a_64.init();
+    h.update(std.mem.asBytes(&size));
+    const win: u64 = 65536;
+    var k: u64 = 0;
+    while (k < 6) : (k += 1) {
+        const off: u64 = if (size <= win) 0 else if (k == 5) size - win else (size - win) * k / 5;
+        var buf: [65536]u8 = undefined;
+        var done: usize = 0;
+        while (done < buf.len) {
+            const got = std.c.pread(fd, buf[done..].ptr, buf.len - done, @intCast(off + done));
+            if (got < 0) {
+                if (std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
+                return null;
+            }
+            if (got == 0) break;
+            done += @intCast(got);
+        }
+        h.update(buf[0..done]);
+        if (size <= win) break;
+    }
+    return h.final();
 }
 
 /// Same identity rule as the spec-cost probe's key: every field the cost
 /// depends on, hashed, so one machine's cliff is never served to another.
-pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8, layout: Layout) []const u8 {
+pub fn cacheKey(buf: []u8, chip: []const u8, model_dir: []const u8, quant: []const u8, os_build: []const u8, layout: Layout, build_id: []const u8) []const u8 {
     var h = std.hash.Fnv1a_64.init();
-    for ([_][]const u8{ chip, model_dir, quant, os_build }) |part| {
+    for ([_][]const u8{ chip, model_dir, quant, os_build, build_id }) |part| {
         h.update(part);
         h.update("\x00");
     }
@@ -866,7 +1057,7 @@ pub fn loadCached(allocator: std.mem.Allocator, io: std.Io, key: []const u8, lay
 
 /// Best-effort: a machine that cannot write re-explores next boot.
 pub fn storeCached(io: std.Io, key: []const u8, t: *const Table) void {
-    if (!persistEnabled() or key.len == 0) return;
+    if (!storeShouldWrite(persistEnabled(), persistDiagArmed(), key.len)) return;
     var dir_buf: [512]u8 = undefined;
     const dir = std.fmt.bufPrint(&dir_buf, "{s}/.mlx-serve/round-cost", .{homeDir()}) catch return;
     std.Io.Dir.cwd().createDirPath(io, dir) catch return;
@@ -1144,12 +1335,12 @@ test "round_cost: persistence round-trips folded cells, marks them stale, reject
     try testing.expect(parse("rc3\n99 0 50 4 3\n", .long) == null);
     try testing.expect(parse("", .long) == null);
     var kb: [64]u8 = undefined;
-    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long), "rc3-"));
+    try testing.expect(std.mem.startsWith(u8, cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long, "x"), "rc3-"));
     var kb2: [64]u8 = undefined;
-    const legacy_key = cacheKey(&kb2, "M4", "/m", "q4g64", "26.4", .legacy);
+    const legacy_key = cacheKey(&kb2, "M4", "/m", "q4g64", "26.4", .legacy, "x");
     try testing.expect(std.mem.startsWith(u8, legacy_key, "rc1-"));
     try testing.expectEqualStrings(
-        cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long)[4..],
+        cacheKey(&kb, "M4", "/m", "q4g64", "26.4", .long, "x")[4..],
         legacy_key[4..],
     );
 }
@@ -1407,6 +1598,17 @@ test "round_cost: the load sweep bounds against the nearest TRUSTED narrower cel
     try testing.expectEqual(@as(u32, 2), t.restored_dropped);
 }
 
+test "round_cost: the load sweep drops a width-1 cell that costs more than its wider neighbour (#382)" {
+    // Width 1 has no narrower cell, so the step bound never reaches it; a narrower round is
+    // strictly less work than a wider one, so the wider neighbour bounds it instead.
+    const t = parse("rc1\n1 1 149.68 1.85 20000\n2 1 86 2.0 5000\n3 1 95 2.4 4000\n1 0 45 1.8 3000\n2 0 42 2.0 3000\n", .legacy) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), t.cells[1][1].n);
+    try testing.expectApproxEqAbs(86.0, t.measuredMs(2, 1).?, 1e-3);
+    // A healthy tail (M4 Max tables reach 1.08x) stays.
+    try testing.expectApproxEqAbs(45.0, t.measuredMs(1, 0).?, 1e-3);
+    try testing.expectEqual(@as(u32, 1), t.restored_dropped);
+}
+
 test "round_cost: ms per token reads tokens MONOTONE in width (a wider draft never accepts fewer)" {
     var t = Table{};
     feed(&t, 2, 1000, 41.0, 3.0);
@@ -1416,4 +1618,65 @@ test "round_cost: ms per token reads tokens MONOTONE in width (a wider draft nev
     try testing.expect(!t.clearlyWorse(3, 2, 0));
     _ = t.observe(4, 1000, 56.0, 1.6, true, false);
     try testing.expectApproxEqAbs(56.0 / 3.0, t.rawMsPerTok(4, 0).?, 1e-3);
+}
+
+test "round_cost: a git sha stands for the executable; without one the executable is hashed" {
+    try testing.expect(!buildIdReadsExe("a1b2c3d"));
+    try testing.expect(buildIdReadsExe(""));
+}
+
+test "round_cost: an artifact fingerprint follows the bytes, not the mtime" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var bytes: [300_000]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    prng.random().bytes(&bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.bin", .data = &bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.bin", .data = &bytes });
+    bytes[150_000] ^= 0x5A;
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.bin", .data = &bytes });
+    var pa: [std.fs.max_path_bytes]u8 = undefined;
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    var pc: [std.fs.max_path_bytes]u8 = undefined;
+    const a = pa[0..try tmp.dir.realPathFile(io, "a.bin", &pa)];
+    const b = pb[0..try tmp.dir.realPathFile(io, "b.bin", &pb)];
+    const c = pc[0..try tmp.dir.realPathFile(io, "c.bin", &pc)];
+    const fa = fileFingerprint(a) orelse return error.NoFingerprint;
+    const fb = fileFingerprint(b) orelse return error.NoFingerprint;
+    const fc = fileFingerprint(c) orelse return error.NoFingerprint;
+    try testing.expectEqual(fa, fb);
+    try testing.expect(fa != fc);
+}
+
+test "round_cost: cacheKey differs for two build ids and matches for the same id" {
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    var c: [64]u8 = undefined;
+    const k1 = cacheKey(&a, "M4", "/m", "q4g64", "26.4", .long, "build-a");
+    const k2 = cacheKey(&b, "M4", "/m", "q4g64", "26.4", .long, "build-b");
+    const k3 = cacheKey(&c, "M4", "/m", "q4g64", "26.4", .long, "build-a");
+    try testing.expect(!std.mem.eql(u8, k1, k2));
+    try testing.expectEqualStrings(k1, k3);
+}
+
+test "round_cost: persist write is a no-op when a diagnostic that adds barriers is armed" {
+    try testing.expect(!persistEnabledFrom(null));
+    try testing.expect(!persistEnabledFrom(""));
+    try testing.expect(!persistEnabledFrom("0"));
+    try testing.expect(persistEnabledFrom("1"));
+    try testing.expect(!persistEnabledFrom("true"));
+    try testing.expect(storeShouldWrite(true, false, 8));
+    try testing.expect(!storeShouldWrite(true, true, 8));
+    try testing.expect(!storeShouldWrite(false, false, 8));
+    try testing.expect(!storeShouldWrite(true, false, 0));
+    try testing.expect(persistDiagArmedFrom(&.{ "1", null, null }));
+    try testing.expect(persistDiagArmedFrom(&.{ null, null, null }) == false);
+    try testing.expect(persistDiagArmedFrom(&.{ "0", "0", "0" }) == false);
+    try testing.expect(persistDiagArmedFrom(&.{ null, "1", null }));
+    try testing.expect(persistDiagArmedFrom(&.{ null, null, "5" }));
+}
+
+test "group pricing keeps the existing long-context store version" {
+    try testing.expectEqual(@as(u32, 3), storeVersion(.long));
 }

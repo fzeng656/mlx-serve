@@ -29,6 +29,7 @@ test {
     _ = @import("dflash.zig");
     _ = @import("mtp.zig");
     _ = @import("round_cost.zig");
+    _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("qwen4_exp.zig");
@@ -36,6 +37,7 @@ test {
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
+    _ = @import("restore_dump.zig");
     _ = @import("metrics.zig");
     _ = @import("status.zig");
     _ = @import("sleep_inhibit.zig");

@@ -10,9 +10,9 @@
 
 | Model | 26.8.6 | 26.8.11 | 26.9.1 | 26.9.2 | speedup |
 |---|---|---|---|---|---|
-| Gemma 4 E4B 4b | 115 | 117 | 114 | 117 | +2% |
-| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 121 | +4% |
-| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 244 mtp | +28% |
-| Qwen3.8 27B 4b (ddalcu MTP) | · | 70 mtp | 71 mtp | 71 mtp | +1% |
-| Qwen3.8 Flash-Next 4b (MTP) | · | 85 mtp | 83 mtp | 89 mtp | +5% |
-| Qwen3.8 27B oQ4e (Jundot MTP) | · | · | 67 mtp | · | · |
+| Gemma 4 E4B 4b | 115 | 117 | 114 | 116 | +1% |
+| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 120 | +3% |
+| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 259 mtp | +36% |
+| Qwen3.8 27B 4b (ddalcu MTP) | · | 70 mtp | 71 mtp | 68 mtp | -3% |
+| Qwen3.8 Flash-Next 4b (MTP) | · | 85 mtp | 83 mtp | 93 mtp | +9% |
+| Qwen3.8 27B oQ4e (Jundot MTP) | · | · | 67 mtp | 61 mtp | -9% |

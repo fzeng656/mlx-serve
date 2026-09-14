@@ -79,6 +79,8 @@ pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
 
 // Stream
 pub extern "c" fn mlx_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_set(stream: *mlx_stream, src: mlx_stream) c_int;
+pub extern "c" fn mlx_stream_equal(lhs: mlx_stream, rhs: mlx_stream) bool;
 pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
 pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
 pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
@@ -253,6 +255,7 @@ pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepd
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_remainder(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_where(res: *mlx_array, condition: mlx_array, x: mlx_array, y: mlx_array, s: mlx_stream) c_int;
 

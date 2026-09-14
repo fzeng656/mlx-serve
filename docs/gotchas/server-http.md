@@ -2,6 +2,18 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### Idle eviction: a reload that leaked, three readers it could free underneath, and a status poll that undid it
+
+`--idle-evict-secs` parsed into `ModelRegistry` and nothing ever swept, so the flag was documented and inert. Adding the sweep surfaced two things the on-demand unload path had been hiding.
+
+First, a leak. `unloadResident` deliberately RETAINS the CPU-side state (`config`, `chat_config`, `tokenizer`, `token_bytes`, `tokenize_cache`) so an unloaded entry stays listable, and the four reload install sites overwrote those pointers without freeing what was there. Nothing noticed while unloads were manual; with a sweep running every few minutes the server grew by the size of its CPU state on every cycle (~196 MB per cycle on Qwen3.8-Flash-Next). `releaseRetainedCpuState` is the one free, called at each install site. `ModelConfig` turned out to own one allocation of its own (`ngram_table_path`), which `freeCpuState` was also dropping on every failed cold load — hence `ModelConfig.deinit`, paired with every `destroy` of a parsed config.
+
+Second, fixing the leak turned three pre-existing benign races into use-after-free. `/api/tags`, `/api/show` and the pre-load text-gen gate in `handleConnection` all read that retained state holding no refcount, and the free runs on the inference thread OUTSIDE the registry mutex — so taking the mutex is necessary but not sufficient. `.loading` is the only state the free can run in (`tryBeginLoadLocked` is its sole writer, under the mutex), so a reader that takes the mutex and observes a non-`.loading` state has a real happens-before edge to the install. The predicate is `!= .loading` rather than `== .ready`: an unloaded entry retains everything and must stay fully listable. The boot load installs into a fresh stub without claiming `.loading`, which is why the precondition is asserted as `state == .loading or config == null` rather than assumed.
+
+Third, the feature did not survive contact with its own clients. `GET /props` fell through to `ensureLoaded`, so a status poll cold-loaded the model — the app's tray polls it every 3 s, and the local status tooling and the OpenCode plugin do too. Eviction worked perfectly and the next poll took the memory straight back, which reads exactly like eviction being broken. A status route answers from the counters when nothing is resident.
+
+Guards: `tests/test_idle_evict.sh` (evicts when idle, reloads under all three concurrent readers, RSS flat across cycles that all end with nothing resident, and still resident with the flag off), `testing.allocator` on the reload-frees test, and behavioural tests on each `.loading` predicate. The locking itself is comment-pinned — a source scan is the obvious guard and this repo bans them.
+
 ### Historical images decoded on every text-only continuation (2026-08-30)
 
 The active-turn media fix stopped the vision tower from re-encoding images behind the latest assistant boundary, but both chat parsers still eagerly base64-decoded, JPEG-decoded, resized, normalized and patchified every attachment before that selector ran. A Harness session retaining 24 images therefore logged 24 image decodes on every later text-only request. Qwen's 44x44 patch grid retains about 8.7 MiB of preprocessed float data per image until the request ends, so the request also carried roughly 200 MiB of avoidable transient buffers. Warm prefix reuse hid most of the latency at 24 images, but the CPU and allocation work grew linearly with conversation history and multiplied under concurrency.
@@ -687,7 +699,7 @@ The whole response fails to parse. Not a degraded field — an unusable response
 from one candidate in one top-5 list. It surfaced as a bare decode error while
 sweeping models for the alignment bug, on one model out of seven.
 
-`jsonEscapeLossy` emits U+FFFD per invalid sequence, using the maximal-subpart
+`chat.utf8Sanitize` emits U+FFFD per invalid sequence, using the maximal-subpart
 rule so a character split across two tokens costs one replacement rather than
 one per byte. `bytes` is untouched and still carries the exact bytes, which is
 OpenAI's own shape and lets a client reassemble across tokens.
@@ -1032,6 +1044,45 @@ out; and `nextConstrained` treats a zero-count mask as a bug it names in the
 log before degrading, instead of sampling through it. The prompt-side
 instruction had been carrying these cases — that is why an
 `additionalProperties` violation read as a model-quality problem.
+
+## JSON-schema decode was 60x slower on Flash Next: the mask walked all 248k tokens per step (#380, 2026-09-07)
+
+`token_mask.buildMask` ran every vocab id through the grammar on every
+generated token: a `restoreFrom` (a memcpy of the whole frame stack, each frame
+carrying a 256-byte key buffer) plus a byte walk, 248k times per step. The
+reporter measured 0.9 tok/s against 54 without `response_format`; on this box
+the same walk cost 3-7 ms in structural states, which the GPU forward mostly
+hid, and the reporter's schema shape made it ~930 ms.
+
+Fix, all in `token_mask.zig`: `TokenBytes.init` indexes the vocabulary once
+per model — buckets by first byte, each bucket ordered by second byte, and a
+split into "plain" string tokens (no quote, backslash or control byte) and the
+rest. A step in a string body (`Grammar.stringBodyRoom`) admits every plain
+token whose length fits the remaining `maxLength` without touching the
+grammar and probes only the ~2.8k others. Any other state asks `allowedBytes`
+for the legal first bytes, and for each one asks again for the legal second
+byte, so only tokens whose first two bytes are legal are walked (the
+second level matters: most BPE tokens start with a space, which is legal
+everywhere between values, so a one-level bucket still probed 107k tokens).
+Mask build is now 0.1-0.4 ms at every state.
+
+Guard: the oracle test in `token_mask.zig` drives a grammar through a whole
+document and diffs the fast mask against the brute-force walk at every byte,
+plus a probe-count bar.
+
+The second half was the constrained step itself. `nextConstrained` sampled
+synchronously and built the next forward from the realized id, so the CPU
+graph build (~840 kernels on Flash Next, ~4 ms) ran while the GPU idled. It
+now samples lazily off the masked logits, hands the still-lazy token to
+`lazyForward` (the same deferred-PLE leaf the unconstrained path uses), dispatches,
+and only then realizes the token and advances the grammar. Byte-identical
+greedy output; Flash Next schema decode 49 -> 53 tok/s = the serial plain rate
+(spec decode stays off under a grammar, so MTP's 65-70 is not the bar).
+
+Trap met on the way: a per-model `"mtp": true` in `model-settings.json`
+overrides `--no-mtp` on the command line, so a "plain" arm launched with the
+flag was still spec-decoding. Send `enable_mtp:false` per request, or read
+the `[spec-stats]` lines, before calling an arm serial.
 
 ## `--no-drafter` did not survive a model switch, and two flags before it didn't either (2026-08-11)
 
@@ -1984,4 +2035,82 @@ length` (prefix_cache.zig).
 
 ### The hot-cache budget was clamped once and never revisited (#364, 2026-09-07)
 
+### A failed restore left a half-bound cache; a commit with every entry checked out never returned (2026-09-08 audit)
+`lookupAndRestore` bound the entry's buffers (`restore` sets `cache.step`) and then ran three fallible steps (`restoreSsmCheckpoint`, `applyQsaHistoryAt`, `truncate`) with no unwind. The one caller maps any error to "no match" and cold-prefills the WHOLE prompt, so a `QsaHistoryGap` (the coverage pre-check maxes the pooled bank over layers, the apply tests per layer) left the prompt in KV twice with every RoPE position past the seam wrong, silently. Fix: an `errdefer` mirroring the no-match arm (truncate to 0, reset SSM entries, `moe_seq_offset = 0`, `last_restored_used = null`). Second defect in the same file: four commit-path eviction loops called `evictOneLru` until the count or byte budget fit, but `lruIndexExcluding` skips checked-out entries and `evictOneLru` is then a no-op; with SSD-first (RAM floors at one CHECKED-OUT session) a second slot's commit spun the inference thread forever. `setBudget` already had the no-progress `break`; `evictOneLruProgress` now gives it to all five loops (the commit proceeds over budget and the next revise re-clamps). Same sweep: the hybrid disk restore adopted the MTP/DFlash sidecar from `dm.idx` (ranked by raw length) while the trunk came from `hm.idx` (ranked by restorable checkpoint); `bestHybridMatch` skipped the `poisoned` filter every sibling lookup has; `meta.json` scalars were `@intCast` after zero-checks only (`bits: 0` tripped `KVQuantConfig.affine`'s assert first). Guards: unit tests on each, in `prefix_cache.zig` and `kv_disk_cache.zig`; the eviction one is red as a TIMEOUT.
+
+### Stream and non-stream disagreed on three edges (2026-09-08 audit)
+A spent reasoning budget set `in_think_block = false` on both streaming surfaces while the model was still thinking, so the rest of the chain-of-thought streamed as the ANSWER (non-streaming truncated the reasoning instead); the budget is now a delivery latch and the tail is withheld until the close tag. The non-streaming tool-call reply hardcoded `content:null`, dropping the "I'll read the file first." the stream had delivered (`visibleToolPreamble` on both surfaces now). A non-streaming client that disconnected got `200`, empty content, `finish_reason:"length"` (the `Slot.init` default) and zero usage, which is exactly what drives an agent's truncation retry (`nonStreamFinishReason` -> `client_disconnect`; live in `mlx-serve-11555.log`). Streaming withheld only the current TOKEN on a stop-sequence match while non-streaming cut at the INDEX (`stopSequenceCut`, four surfaces; a match that BEGINS in already-sent bytes is still open). And `seed`, `max_tokens`, `reasoning_budget_tokens` were `@intCast` from the JSON integer: `seed: -1` (the llama.cpp "random" convention) was ReleaseFast UB. Guards: unit tests on the four pure helpers; the budget arm's bar is stream-vs-non-stream content equality, live only.
+
 `max_kv_bytes` had one write site, `initWithMem`, fed by a clamp that read `mlx_get_active_memory`, which counts every resident model. Load a second model beside a 70 GB one and its budget landed at ~0 for the life of the process (197 straight declines on the reporter's box); unloading the neighbour did not give it back. Fix: `reviseHotCacheBudgets` runs after every load/unload on the inference thread and re-resolves each resident model's budget with its own resident cache bytes excluded (a full cache must not ratchet itself down); `setBudget` evicts LRU down to a smaller cap and is silent when the megabyte value is unchanged. Trap found on the way: MLX frees the weights at once but the system-free number the ceiling reads recovers over seconds, so the unload-time revise saw almost none of it; the revise repeats before each prefill batch for 10 s after an unload. The resolver publishes a process-global the admission guard reads, so the current model is resolved last. Guard: `tests/test_prefix_cache_budget_revisit.sh` (A loses B's weights when B loads and gets them back after the unload, warm turn intact).
+
+### An image turn could not inherit the checkpoints it restored from (2026-09-08)
+
+Live: a 400k qwen4_exp opencode session, 43 turns each carrying one screenshot at position 348211, then one text-only turn — `[hot-cache] hybrid miss (no checkpoint <= 348211 of 399199)` and a 348k-token cold prefill. `findBestRestorableMatch` already knew that rows before a media placeholder are ordinary text and cross pixel keys, so the image turn restored the text prefix correctly; `bestCheckpointDonor` did not, and demanded exact `vision_key` equality. The image commit therefore landed as a fresh pixel-keyed entry with only its own tail checkpoints (all above the boundary), the count cap evicted the text entry, and the boundary — exactly where the next text turn is capped — held nothing. Fix: the donor scan takes the commit's `eff_media_start` and applies the same cross-key rule, so a key-mismatched entry donates checkpoints at or below `min(entry.media_start, commit media_start)`; `shared` is already clamped to that boundary, which is the inheritance limit `cloneCheckpointsUpTo` gets.
+
+The class behind it: retention had no idea a boundary existed. `spanPreservingDropIndex` thins the interior by narrowest span, and the checkpoint at a media boundary is a known future divergence point that a later text-only turn is the only consumer of — in a dense stretch it is exactly what the scan picks. It now takes a `protect` index (the way the newest quarter is protected), and both hot-cache thinning sites pass `boundaryCheckpointIndex(cps, media_start)`. Protecting the sole candidate falls back to dropping the oldest, which sits below the protected position, so the invariant holds either way. Guards: `HotPrefixCache: a text turn after image turns restores the pre-media prefix` (instance) and `HotPrefixCache: thinning keeps the highest checkpoint below the media boundary` (class); integration `tests/test_vision_prefix_cache.sh`.
+
+### A reply that is not valid UTF-8 is LOST, not degraded (2026-09-07)
+
+`test_multi_model_concurrent.sh` died in `json.load`: a 27B pack answering with
+byte-level garbage emitted a lone UTF-8 lead byte in `message.content`, and the
+whole reply became unparseable for every strict client. The 2026-08-05 fix had
+found this class in `top_logprobs` and stopped there, on the claim that every
+other string we emit is "valid UTF-8 by construction". It is not: `content` is
+decoded model bytes like any other, and a model can emit the lead of a
+multi-byte character and never complete it.
+
+Fix: sanitizing lives INSIDE the escaper so no call site can forget it.
+`chat.utf8Next` is the one sequence walker; `server.jsonEscape`,
+`responses.jsonEscape`, `chat.appendJsonString` (the prompt render: nlohmann
+rejects invalid UTF-8 exactly as it rejects a raw control byte, the silent
+`fallbackFormatChat` class) and `ollama.writeJsonString` all replace an invalid
+sequence with one U+FFFD. Valid input is byte-identical.
+
+Guard: `EVERY JSON string escaper survives bytes that are not valid UTF-8`
+(server.zig), one invariant over all four.
+
+
+## Constrained JSON routing and buffer lifetimes
+
+A reasoning marker inside schema-valid JSON is data. The generator publishes the
+first payload token and byte offset; `reasoning_protocol.Delivery` is shared by
+streaming and batch HTTP responses and never reparses bytes after that boundary.
+This also applies with thinking disabled and to apparent tool-call markup.
+
+Keep both normalization and delivery buffers alive until the response is serialized.
+Assigning `final_text` from a router inside Anthropic's thinking-block scope and
+deinitializing that router at the closing brace caused invalid UTF-8 in the later
+text block. The live marker regression caught it even though the protocol tests
+passed. Guards: `tests/test_json_schema_protocol_routing.py` (all three APIs,
+streaming and non-streaming), the constrained JSON format-corpus invariant, and
+the split/UTF-8/stop tests in `src/reasoning_protocol.zig`.
+## Qwen3-Embedding sub-batches shared one KV cache (2026-09-10)
+
+A `/v1/embeddings` request splits into sub-batches once rows x longest input passes
+`EMBED_TOKEN_BUDGET` (64 x 512): 64 inputs with one over 512 tokens is enough. BERT and the
+EmbeddingGemma encoder hold no KV state, but Qwen3-Embedding runs the ordinary decoder forward,
+which appends to `xfm.cache`, and the cache was reset once per REQUEST (`runEmbedRequest`), not
+per sub-batch as issue #116 asked. Sub-batch 2 wrote its keys after sub-batch 1's, so its rows
+attended causally to sub-batch 1's rows of the same index at shifted RoPE positions. Where the
+cache write could carry those rows into the new shape (typically a second sub-batch no larger
+than the first) the request answered 200 with wrong vectors; otherwise it failed with
+`broadcast_shapes` and a 500, and the model's next embeddings request crashed in `freeKVEntry`
+(a separate `updateDense` defect). Fix: the reset moved from `runEmbedRequest` into
+`computeEmbeddingsBatch`, before every sub-batch. Guard: `tests/test_embeddings.sh` [4c] (the
+later of two equal sub-batches matches the same inputs sent alone, a second sub-batch with more
+rows answers 200, the server still answers afterwards).
+
+
+## A grammar-masked model idled on whitespace until the loop guard cut it (2026-09-12)
+
+Qwen3.8-27B, thinking on, a schema whose enum value spells reasoning markers: on a
+hot-cache hit greedy diverged a little from the cold run and, once the JSON grammar
+was armed, the model's real argmax was off-schema. The only admitted token it liked
+was `\n`, the grammar accepted free whitespace without bound, and thirty of them
+tripped the exact-cycle loop guard: `finish_reason "length"`, empty content, valid
+JSON never produced. Cold requests were fine, and main and PR #407 behaved the same.
+
+Fix: `json_grammar` counts consecutive free-whitespace bytes (`ws_run`, carried by
+snapshots) and rejects past `MAX_FREE_WS` (16) between tokens and after the root, so
+the mask forces the next structural byte. Content is never constrained by it, only
+formatting. Guard: `free whitespace is capped so a masked model cannot idle forever`.

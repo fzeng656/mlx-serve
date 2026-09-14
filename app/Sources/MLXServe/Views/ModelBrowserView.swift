@@ -249,8 +249,6 @@ private struct RecommendedModelTable: View {
                    picks: RecommendedModelPick.gemmaCatalog),
             Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
-            Family(id: "laguna", title: "Laguna", systemImage: "chevron.left.forwardslash.chevron.right", tint: .purple,
-                   picks: RecommendedModelPick.poolsideCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]
@@ -317,19 +315,41 @@ private struct RecommendedTableHeader: View {
 
 /// Two thin comparative bars — intelligence (blue) over speed (green) — the
 /// compact, table-cell form of the retired `CapabilityBars`. No number is
-/// drawn: the scores are a hand-maintained comparison between these picks (see
-/// `RecommendedModels.swift`'s header), and printing "62" would claim a
-/// precision they don't have. The tooltip names the two bars and flags an
-/// estimated intelligence score.
+/// drawn in the cell: the scores are a hand-maintained comparison between
+/// these picks (see `RecommendedModels.swift`'s header). Hovering floats a
+/// card that names each bar and prints its score — the bars alone cannot say
+/// which is which.
 private struct MiniCapability: View {
     let pick: RecommendedModelPick
+    @State private var hovering = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             bar(pick.intelligenceBar, .blue)
             bar(pick.speedBar, .green)
         }
-        .help("Top bar: intelligence\(pick.intelligenceIsEstimated ? " (our estimate)" : ""). Bottom bar: speed. Both relative to the models here.")
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottomLeading) {
+            if hovering {
+                tip.offset(y: -18).fixedSize()
+            }
+        }
+        .zIndex(hovering ? 1 : 0)
+    }
+
+    private var tip: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(CapabilityTip.lines(for: pick), id: \.self) { line in
+                Text(line).font(.caption)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+        .shadow(radius: 4, y: 2)
+        .allowsHitTesting(false)
     }
 
     private func bar(_ fill: Double, _ tint: Color) -> some View {

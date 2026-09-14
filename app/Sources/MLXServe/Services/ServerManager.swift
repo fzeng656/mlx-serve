@@ -51,6 +51,7 @@ class ServerManager: ObservableObject {
     /// What the server's measured spec-decode cost model resolved for the
     /// resident model. nil = the per-silicon tables applied.
     @Published var specCost: SpecCostInfo?
+    @Published var batching: BatchingInfo?
     /// Live throughput, nil when the server runs without `--metrics`.
     @Published var throughput: ThroughputSnapshot?
     /// Live decode / prefill tok/s, derived from the gauge delta between the
@@ -65,7 +66,7 @@ class ServerManager: ObservableObject {
     private var healthTimer: Timer?
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
-    private let api = APIClient()
+    let api = APIClient()
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
     /// stop polling entirely instead of burning 3 s ticks in the background.
@@ -184,6 +185,7 @@ class ServerManager: ObservableObject {
     /// termination handler, and health polling.
     private func launch(args: [String], options: ServerOptions) {
         port = options.port
+        api.host = options.host
         status = .starting
         lastError = ""
         chatDefaultEnsured = false
@@ -303,6 +305,7 @@ class ServerManager: ObservableObject {
         allModels = []
         memoryInfo = nil
         specCost = nil
+        batching = nil
         throughput = nil
         decodeTPSNow = nil
         prefillTPSNow = nil
@@ -419,18 +422,6 @@ class ServerManager: ObservableObject {
         logBuffer.clear()
     }
 
-    /// The gen panes' "Show Log" body: the pane's own stream lines, with the
-    /// server log's tail appended — or standing alone, because a model that
-    /// failed to LOAD never streamed anything, so the pane log is empty for
-    /// exactly the failure people click Log for (live 2026-08-08: a memory
-    /// refusal showed "(no output)"). ONE copy; it was pasted into all four
-    /// gen views, which is how a tweak lands in some panes and not others.
-    nonisolated func combinedGenLog(own lines: [String]) -> String {
-        let own = lines.joined(separator: "\n")
-        let serverTail = String(currentServerLogSnapshot().suffix(6000))
-        return own.isEmpty ? serverTail : own + "\n\n——— server log ———\n" + serverTail
-    }
-
     /// Pure helper: clamp `buf` to at most `maxBytes` characters by keeping
     /// the tail. Mirrors `String(buf.suffix(maxBytes))` but avoids the
     /// alloc when already in range, and well-defined at the degenerate
@@ -540,13 +531,14 @@ class ServerManager: ObservableObject {
     private func startHealthPolling() {
         healthTask?.cancel()
         let checkPort = port
+        let healthURL = api.serverURL(port: checkPort, path: "/health")
         // Use a GCD timer on the main queue — guaranteed to fire even during init.
         // URLSession completion runs on a background queue and dispatches back to main.
         let source = DispatchSource.makeTimerSource(queue: .main)
         source.schedule(deadline: .now() + 1, repeating: 1.0)
         source.setEventHandler { [weak self] in
             guard let self else { source.cancel(); return }
-            let url = URL(string: "http://127.0.0.1:\(checkPort)/health")!
+            let url = healthURL
             URLSession.shared.dataTask(with: url) { data, response, error in
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -625,6 +617,7 @@ class ServerManager: ObservableObject {
         if let props = try? await api.fetchProps(port: port) {
             memoryInfo = props.memory
             specCost = props.specCost
+            batching = props.batching
         }
         if let snap = try? await api.fetchThroughput(port: port) {
             if let prev = throughput {
