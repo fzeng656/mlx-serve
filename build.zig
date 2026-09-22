@@ -777,6 +777,17 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
 fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("lib/mlx/include"));
     module.addLibraryPath(b.path("lib/mlx/lib"));
+    // mlx-serve-owned no-copy mmap bridge. It uses MLX's public C++ array /
+    // allocator API so safetensors shards can remain file-backed while Zig
+    // continues to consume ordinary mlx_array handles.
+    module.addIncludePath(b.path("src"));
+    module.addCSourceFile(.{
+        .file = b.path("src/mlx_mmap_shim.cpp"),
+        .flags = &.{ "-O2", "-std=c++20", "-Wno-unused-parameter" },
+    });
+    // The shim calls core allocator/array symbols directly (mlxc itself also
+    // depends on this dylib, but make the direct dependency explicit).
+    module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
     // use_pkg_config = .no: a leftover Homebrew mlx-c must never hijack this
     // link — we want exactly the staged NAX-enabled pair (same class as the
     // llama.pc hijack above).
