@@ -5228,18 +5228,23 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     frontier_cp: {
         const cp_alloc = gen_ptr.ssm_checkpoint_alloc orelse break :frontier_cp;
         const xfm = slot.model.transformer orelse break :frontier_cp;
-        var cp = transformer_mod.captureSsmCheckpoint(
+        // Allocate the enlarged owner slice first. This preserves the upstream
+        // one-owner rule in commitSlotIfApplicable: after capture succeeds the
+        // checkpoint always moves directly into a slice that will transfer to
+        // HotPrefixCache; no caller-side checkpoint deinit exists on an error
+        // path.
+        const grown = cp_alloc.alloc(transformer_mod.SSMCheckpoint, ssm_cps_slice.len + 1) catch |err| {
+            log.warn("[hot-cache] decode frontier checkpoint allocation failed: {s}\n", .{@errorName(err)});
+            break :frontier_cp;
+        };
+        const cp = transformer_mod.captureSsmCheckpoint(
             cp_alloc,
             slot.ssm_entries.?,
             total_len,
             xfm.s,
         ) catch |err| {
+            cp_alloc.free(grown);
             log.warn("[hot-cache] decode frontier checkpoint capture failed at {d}: {s}\n", .{ total_len, @errorName(err) });
-            break :frontier_cp;
-        };
-        const grown = cp_alloc.alloc(transformer_mod.SSMCheckpoint, ssm_cps_slice.len + 1) catch |err| {
-            cp.deinit(cp_alloc);
-            log.warn("[hot-cache] decode frontier checkpoint allocation failed: {s}\n", .{@errorName(err)});
             break :frontier_cp;
         };
         @memcpy(grown[0..ssm_cps_slice.len], ssm_cps_slice);
