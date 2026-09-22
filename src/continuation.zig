@@ -54,6 +54,93 @@ pub fn make(kind: Kind, value: []const u8) ?Binding {
     };
 }
 
+
+/// Opaque pointer to an exact hot-cache frontier.  The continuation layer does
+/// not know KV/SSM internals; it only remembers enough identity for the model
+/// cache to locate the exact entry later.
+pub const FrontierRef = struct {
+    /// Process-local model identity (model registry assigns this later).
+    model_tag: u64,
+    /// Exact hot-cache entry identity. Never derived from a client value.
+    entry_tag: u64,
+    /// Exact model-state frontier represented by the entry.
+    token_len: u32,
+    /// Workload/session affinity only; not part of the authorization decision.
+    cache_key: u64 = 0,
+};
+
+const Record = struct {
+    kind: Kind,
+    digest: u64,
+    frontier: FrontierRef,
+    stamp: u64,
+};
+
+/// Small process-local registry from protocol proof -> exact model frontier.
+///
+/// Only strong bindings may enter this table.  A session hint can choose/retain
+/// a cache lineage, but can never resolve to a divergent live state.
+pub const Registry = struct {
+    allocator: std.mem.Allocator,
+    cap: usize,
+    clock: u64 = 0,
+    records: std.ArrayListUnmanaged(Record) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, cap: usize) Registry {
+        return .{ .allocator = allocator, .cap = @max(cap, 1) };
+    }
+
+    pub fn deinit(self: *Registry) void {
+        self.records.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn bind(self: *Registry, binding: Binding, frontier: FrontierRef) !bool {
+        if (!binding.authorizesDivergentReuse()) return false;
+        self.clock +%= 1;
+
+        for (self.records.items) |*record| {
+            if (record.kind == binding.kind and record.digest == binding.digest) {
+                record.frontier = frontier;
+                record.stamp = self.clock;
+                return true;
+            }
+        }
+
+        if (self.records.items.len >= self.cap) {
+            var oldest_i: usize = 0;
+            var oldest_stamp = self.records.items[0].stamp;
+            for (self.records.items[1..], 1..) |record, i| {
+                if (record.stamp < oldest_stamp) {
+                    oldest_i = i;
+                    oldest_stamp = record.stamp;
+                }
+            }
+            _ = self.records.swapRemove(oldest_i);
+        }
+
+        try self.records.append(self.allocator, .{
+            .kind = binding.kind,
+            .digest = binding.digest,
+            .frontier = frontier,
+            .stamp = self.clock,
+        });
+        return true;
+    }
+
+    pub fn resolve(self: *Registry, binding: Binding) ?FrontierRef {
+        if (!binding.authorizesDivergentReuse()) return null;
+        for (self.records.items) |*record| {
+            if (record.kind == binding.kind and record.digest == binding.digest) {
+                self.clock +%= 1;
+                record.stamp = self.clock;
+                return record.frontier;
+            }
+        }
+        return null;
+    }
+};
+
 pub const Surface = enum {
     chat_completions,
     responses,
@@ -194,4 +281,44 @@ test "collect covers OpenAI chat, Responses, and Anthropic tool continuations" {
         try std.testing.expectEqual(@as(usize, 2), set.len);
         try std.testing.expect(set.hasStrong());
     }
+}
+
+
+test "registry binds only server-confirmed strong protocol identities" {
+    var reg = Registry.init(std.testing.allocator, 4);
+    defer reg.deinit();
+
+    const frontier = FrontierRef{
+        .model_tag = 11,
+        .entry_tag = 22,
+        .token_len = 100_123,
+        .cache_key = 33,
+    };
+
+    const weak = make(.prompt_cache_key, "sess").?;
+    try std.testing.expect(!(try reg.bind(weak, frontier)));
+    try std.testing.expect(reg.resolve(weak) == null);
+
+    const strong = make(.tool_call_id, "call_abc").?;
+    try std.testing.expect(try reg.bind(strong, frontier));
+    const got = reg.resolve(strong).?;
+    try std.testing.expectEqual(frontier.entry_tag, got.entry_tag);
+    try std.testing.expectEqual(frontier.token_len, got.token_len);
+}
+
+test "registry is bounded and refreshes resolved bindings" {
+    var reg = Registry.init(std.testing.allocator, 2);
+    defer reg.deinit();
+
+    const a = make(.previous_response_id, "resp_a").?;
+    const b = make(.previous_response_id, "resp_b").?;
+    const c = make(.previous_response_id, "resp_c").?;
+    _ = try reg.bind(a, .{ .model_tag = 1, .entry_tag = 1, .token_len = 10 });
+    _ = try reg.bind(b, .{ .model_tag = 1, .entry_tag = 2, .token_len = 20 });
+    _ = reg.resolve(a); // a becomes MRU
+    _ = try reg.bind(c, .{ .model_tag = 1, .entry_tag = 3, .token_len = 30 });
+
+    try std.testing.expect(reg.resolve(a) != null);
+    try std.testing.expect(reg.resolve(b) == null);
+    try std.testing.expect(reg.resolve(c) != null);
 }
