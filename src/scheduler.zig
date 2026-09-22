@@ -281,8 +281,12 @@ pub const SubmitParams = struct {
     vision_embeddings: ?mlx.mlx_array = null,
     /// Prefix-cache key for the media under the placeholder tokens (0 = none).
     vision_key: u64 = 0,
-    /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
+    /// Workload key for hot-cache eviction.
     cache_key: u64 = 0,
+    /// Protocol-bound continuation.
+    continuation_model_tag: u64 = 0,
+    continuation_frontier_tag: ?u64 = null,
+    continuation_suffix: ?[]const u32 = null,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
@@ -470,6 +474,9 @@ pub const Slot = struct {
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64 = 0,
+    continuation_model_tag: u64 = 0,
+    continuation_frontier_tag: ?u64 = null,
+    continuation_suffix: ?[]u32 = null,
     /// Exact RAM hot-cache frontier committed by this turn when the full
     /// model state was retained without a byte-budget trim or decline.
     committed_frontier_tag: ?u64 = null,
@@ -700,6 +707,11 @@ pub const Slot = struct {
         );
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
+        const continuation_suffix_owned: ?[]u32 = if (params.continuation_suffix) |suffix|
+            try allocator.dupe(u32, suffix)
+        else
+            null;
+        errdefer if (continuation_suffix_owned) |suffix| allocator.free(suffix);
 
         slot.* = .{
             .allocator = allocator,
@@ -711,6 +723,9 @@ pub const Slot = struct {
             .vision_embeddings = params.vision_embeddings,
             .vision_key = params.vision_key,
             .cache_key = params.cache_key,
+            .continuation_model_tag = params.continuation_model_tag,
+            .continuation_frontier_tag = params.continuation_frontier_tag,
+            .continuation_suffix = continuation_suffix_owned,
             .committed_frontier_tag = null,
             .committed_frontier_tokens = 0,
             .media_start = media_start,
@@ -840,6 +855,7 @@ pub const Slot = struct {
         if (self.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
         if (self.mrope_pos) |mp| self.allocator.free(mp);
         self.allocator.free(self.prompt_ids);
+        if (self.continuation_suffix) |suffix| self.allocator.free(suffix);
         self.allocator.free(self.full_prompt);
         self.allocator.free(self.eos_token_ids);
         if (self.error_code) |code| self.allocator.free(code);
@@ -6385,6 +6401,46 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         use_mtp,             use_dflash,          use_drafter,          use_pld,
         slot.enable_drafter, slot.dflash != null, slot.drafter != null,
     });
+
+    // Protocol-bound live continuation: materialize the exact model-token
+    // frontier remembered by the hot cache, then append only the suffix that
+    // the protocol adapter proved is new. The ordinary prefix lookup below
+    // performs the actual KV/SSM restore against this canonical prompt.
+    if (slot.continuation_frontier_tag) |frontier_tag| {
+        if (slot.continuation_suffix) |suffix| {
+            if (slot.model.prefix_cache) |*hc| {
+                if (slot.vision_key == 0 and
+                    slot.continuation_model_tag == hc.cacheInstanceTag())
+                {
+                    const built = hc.buildContinuationPrompt(
+                        slot.allocator,
+                        frontier_tag,
+                        suffix,
+                        slot.has_tools,
+                        0,
+                        slot.cache.config,
+                    ) catch null;
+                    if (built) |continuation_prompt| {
+                        const old_len = slot.full_prompt.len;
+                        slot.allocator.free(slot.full_prompt);
+                        slot.full_prompt = continuation_prompt.tokens;
+                        slot.media_start = null;
+                        log.info("[live-cont] canonical prompt @{d}: base={d} suffix={d} wire={d} canonical={d}\n", .{
+                            frontier_tag,
+                            continuation_prompt.base_len,
+                            suffix.len,
+                            old_len,
+                            slot.full_prompt.len,
+                        });
+                    } else {
+                        log.info("[live-cont] frontier @{d} unavailable/incompatible; ordinary replay\n", .{frontier_tag});
+                    }
+                } else {
+                    log.info("[live-cont] stale model frontier @{d}; ordinary replay\n", .{frontier_tag});
+                }
+            }
+        }
+    }
 
     // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
     // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on

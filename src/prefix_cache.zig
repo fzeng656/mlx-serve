@@ -22,6 +22,8 @@ const kv_quant = @import("kv_quant.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
+
+var next_cache_instance_tag = std.atomic.Value(u64).init(1);
 const restore_dump = @import("restore_dump.zig");
 
 const KVCache = transformer_mod.KVCache;
@@ -370,6 +372,8 @@ pub const EvictionReport = struct {
 
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
+    /// Process-local cache instance identity. Changes on every model reload.
+    instance_tag: u64,
     max_entries: u32,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
     /// all entries. 0 disables the byte budget (count cap still applies).
@@ -437,13 +441,50 @@ pub const HotPrefixCache = struct {
         return self.last_commit_tag;
     }
 
+    pub fn cacheInstanceTag(self: *const HotPrefixCache) u64 {
+        return self.instance_tag;
+    }
+
+    pub const ContinuationPrompt = struct {
+        tokens: []u32,
+        base_len: usize,
+    };
+
+    /// Materialize the exact model-token prefix owned by a previously committed
+    /// frontier and append a protocol-derived suffix. No client value can select
+    /// an entry directly; callers must first resolve a server-issued frontier tag.
+    pub fn buildContinuationPrompt(
+        self: *const HotPrefixCache,
+        allocator: std.mem.Allocator,
+        frontier_tag: u64,
+        suffix: []const u32,
+        has_tools: bool,
+        vision_key: u64,
+        quant_config: kv_quant.KVQuantConfig,
+    ) !?ContinuationPrompt {
+        if (frontier_tag == 0 or suffix.len == 0) return null;
+        for (self.entries.items) |*e| {
+            if (e.frontier_tag != frontier_tag) continue;
+            if (e.has_tools != has_tools) return null;
+            if (e.vision_key != vision_key) return null;
+            if (!std.meta.eql(e.quant_config, quant_config)) return null;
+            const out = try allocator.alloc(u32, e.tokens.len + suffix.len);
+            @memcpy(out[0..e.tokens.len], e.tokens);
+            @memcpy(out[e.tokens.len..], suffix);
+            return .{ .tokens = out, .base_len = e.tokens.len };
+        }
+        return null;
+    }
+
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
     }
 
     pub fn initWithMem(allocator: std.mem.Allocator, max_entries: u32, max_kv_bytes: u64) HotPrefixCache {
+        const tag = next_cache_instance_tag.fetchAdd(1, .monotonic);
         return .{
             .entries = std.ArrayList(Entry).empty,
+            .instance_tag = if (tag == 0) 1 else tag,
             .max_entries = if (max_entries == 0) 1 else max_entries,
             .max_kv_bytes = max_kv_bytes,
             .current_kv_bytes = 0,
@@ -3045,6 +3086,34 @@ test "HotPrefixCache: init zero capacity clamps to 1" {
     defer cache.deinit();
     try testing.expectEqual(@as(u32, 1), cache.max_entries);
     try testing.expectEqual(@as(usize, 0), cache.entryCount());
+}
+
+
+test "HotPrefixCache: continuation prompt is selected only by exact server frontier tag" {
+    var cache = HotPrefixCache.init(testing.allocator, 2);
+    defer cache.deinit();
+
+    const ids = try testing.allocator.dupe(u32, &[_]u32{ 10, 20, 30 });
+    try cache.entries.append(testing.allocator, .{
+        .frontier_tag = 77,
+        .tokens = ids,
+        .has_tools = true,
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .last_used = 1,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = 0,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+
+    const suffix = [_]u32{ 40, 50 };
+    const built = (try cache.buildContinuationPrompt(testing.allocator, 77, &suffix, true, 0, kv_quant.KVQuantConfig.dense)).?;
+    defer testing.allocator.free(built.tokens);
+    try testing.expectEqual(@as(usize, 3), built.base_len);
+    try testing.expectEqualSlices(u32, &[_]u32{ 10, 20, 30, 40, 50 }, built.tokens);
+
+    try testing.expect((try cache.buildContinuationPrompt(testing.allocator, 78, &suffix, true, 0, kv_quant.KVQuantConfig.dense)) == null);
+    try testing.expect((try cache.buildContinuationPrompt(testing.allocator, 77, &suffix, false, 0, kv_quant.KVQuantConfig.dense)) == null);
 }
 
 test "HotPrefixCache: findBestMatch returns longest shared prefix" {

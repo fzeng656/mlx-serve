@@ -42,6 +42,21 @@ fn strengthFor(kind: Kind) Strength {
 }
 
 /// Domain-separated digest: identical bytes in two protocol fields never alias.
+pub fn tokenFingerprint(tokens: []const u32) u64 {
+    var h = std.hash.Wyhash.init(0x56495349424c454b); // "VISIBLEK"
+    for (tokens) |token| {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, token, .little);
+        h.update(&bytes);
+    }
+    return h.final();
+}
+
+pub fn visibleMatches(frontier: FrontierRef, tokens: []const u32) bool {
+    return frontier.visible_tokens == tokens.len and
+        frontier.visible_hash == tokenFingerprint(tokens);
+}
+
 pub fn make(kind: Kind, value: []const u8) ?Binding {
     if (value.len == 0) return null;
     var h = std.hash.Wyhash.init(0x4c495645434f4e54); // "LIVECONT"
@@ -67,6 +82,10 @@ pub const FrontierRef = struct {
     token_len: u32,
     /// Workload/session affinity only; not part of the authorization decision.
     cache_key: u64 = 0,
+    /// Canonical client-visible history that selected this frontier. A strong
+    /// protocol id alone does not authorize ignoring edited history.
+    visible_hash: u64 = 0,
+    visible_tokens: u32 = 0,
 };
 
 const Record = struct {
@@ -321,4 +340,19 @@ test "registry is bounded and refreshes resolved bindings" {
     try std.testing.expect(reg.resolve(a) != null);
     try std.testing.expect(reg.resolve(b) == null);
     try std.testing.expect(reg.resolve(c) != null);
+}
+
+
+test "visible history fingerprint rejects edited replay under the same strong id" {
+    const original = [_]u32{ 1, 2, 3, 4 };
+    const edited = [_]u32{ 1, 2, 9, 4 };
+    const f = FrontierRef{
+        .model_tag = 1,
+        .entry_tag = 2,
+        .token_len = 4,
+        .visible_hash = tokenFingerprint(&original),
+        .visible_tokens = original.len,
+    };
+    try std.testing.expect(visibleMatches(f, &original));
+    try std.testing.expect(!visibleMatches(f, &edited));
 }

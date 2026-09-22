@@ -389,6 +389,33 @@ pub fn formatChat(
     return ids.toOwnedSlice(allocator);
 }
 
+/// Render completed history without opening a new assistant turn. This is the
+/// stable visible-prefix key used by protocol-bound live continuation.
+pub fn formatChatHistory(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    messages: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+) ![]u32 {
+    const rendered = try renderChatTemplateWithGenerationPrompt(
+        allocator, messages, chat_config, tools_json, tool_choice_instruction,
+        enable_thinking, effort, false, false,
+    );
+    defer allocator.free(rendered);
+
+    var ids = std.ArrayList(u32).empty;
+    errdefer ids.deinit(allocator);
+    if (chat_config.add_bos_token) {
+        if (tok.bos_id) |bos| try ids.append(allocator, bos);
+    }
+    try encodeWithSpecialTokens(allocator, tok, rendered, &ids);
+    return ids.toOwnedSlice(allocator);
+}
+
 /// Render + encode chat messages via the embedded ds4 engine's chat template.
 /// ds4 owns its own tokenizer and chat-template renderer — we just map our
 /// `Message` array to ds4's `ChatTurn` shape and append the assistant prefix.
@@ -576,9 +603,26 @@ fn renderChatTemplate(
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
     effort: ?[]const u8,
-    /// Extend the trailing assistant message instead of answering after it —
-    /// the prompt ends mid-turn and generation resumes from its last word.
     continue_final: bool,
+) ![]const u8 {
+    return renderChatTemplateWithGenerationPrompt(
+        allocator, messages, chat_config, tools_json, tool_choice_instruction,
+        enable_thinking, effort, continue_final, true,
+    );
+}
+
+fn renderChatTemplateWithGenerationPrompt(
+    allocator: std.mem.Allocator,
+    messages: []const Message,
+    chat_config: *const ChatConfig,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    effort: ?[]const u8,
+    /// Extend the trailing assistant message instead of answering after it.
+    continue_final: bool,
+    /// Whether the template should append its assistant generation prefix.
+    add_generation_prompt: bool,
 ) ![]const u8 {
     // Split the partial reply off FIRST, so every transform below (tool
     // fallback synthesis, muse's reasoning drop) sees exactly the message list
@@ -588,7 +632,7 @@ fn renderChatTemplate(
     const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
 
     if (chat_config.chat_template.len == 0) {
-        const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+        const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking, add_generation_prompt);
         if (prefill) |partial| {
             defer allocator.free(base);
             return std.mem.concat(allocator, u8, &.{ base, partial });
@@ -690,7 +734,7 @@ fn renderChatTemplate(
         msgs_z.ptr,
         if (tools_z) |tz| tz.ptr else null,
         extra_z.ptr,
-        1,
+        if (add_generation_prompt) 1 else 0,
         &rendered_len,
     );
 
@@ -707,10 +751,11 @@ fn renderChatTemplate(
                 collapsed, contentChannelTail(tpl, collapsed, true), partial,
             });
         }
-        if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
+        if (add_generation_prompt)
+            if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
             defer allocator.free(collapsed);
             return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
-        }
+        };
         return collapsed;
     }
 
@@ -722,7 +767,7 @@ fn renderChatTemplate(
     if (jinja_c.jinja_last_error()) |e| {
         log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
     }
-    const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    const base = try fallbackFormatChat(allocator, msgs, chat_config, tools_json, tool_choice_instruction, enable_thinking, add_generation_prompt);
     if (prefill) |partial| {
         defer allocator.free(base);
         return std.mem.concat(allocator, u8, &.{ base, partial });
@@ -1281,6 +1326,7 @@ fn fallbackFormatChat(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    add_generation_prompt: bool,
 ) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
@@ -1334,8 +1380,10 @@ fn fallbackFormatChat(
                 try result.appendSlice(allocator, "<|im_end|>\n");
             }
         }
-        try result.appendSlice(allocator, "<|im_start|>assistant\n");
-        if (std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null) {
+        if (add_generation_prompt) {
+            try result.appendSlice(allocator, "<|im_start|>assistant\n");
+        }
+        if (add_generation_prompt and std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null) {
             if (enable_thinking) {
                 try result.appendSlice(allocator, "<think>\n");
             } else {
@@ -1391,7 +1439,8 @@ fn fallbackFormatChat(
                     try result.appendSlice(allocator, "<|eot_id|>");
                 }
             }
-            try result.appendSlice(allocator, "<|start_header_id|>assistant<|end_header_id|>\n\n");
+            if (add_generation_prompt)
+                try result.appendSlice(allocator, "<|start_header_id|>assistant<|end_header_id|>\n\n");
         } else {
             // Gemma-style format
             if (tools_json != null and !has_system) {
@@ -1413,7 +1462,8 @@ fn fallbackFormatChat(
                     try result.appendSlice(allocator, "<end_of_turn>\n");
                 }
             }
-            try result.appendSlice(allocator, "<start_of_turn>model\n");
+            if (add_generation_prompt)
+                try result.appendSlice(allocator, "<start_of_turn>model\n");
         }
     }
 
@@ -10231,7 +10281,7 @@ test "fallbackFormatChat ChatML with tool calls and responses" {
     defer if (config.eos_token) |t| allocator.free(t);
 
     const tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"shell\"}}]";
-    const result = try fallbackFormatChat(allocator, &messages, &config, tools_json, null, false);
+    const result = try fallbackFormatChat(allocator, &messages, &config, tools_json, null, false, true);
     defer allocator.free(result);
 
     // Should have <tool_call> block for assistant
@@ -10258,7 +10308,7 @@ test "fallbackFormatChat ChatML tool response uses user role" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false, true);
     defer allocator.free(result);
 
     // Tool responses in ChatML use <|im_start|>user role
@@ -10282,7 +10332,7 @@ test "fallbackFormatChat Gemma tool response uses user role" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false, true);
     defer allocator.free(result);
 
     // Gemma tool results should be in user turn
@@ -10305,7 +10355,7 @@ test "fallbackFormatChat Llama tool response uses ipython role" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false, true);
     defer allocator.free(result);
 
     // Llama tool results use ipython role
@@ -10330,7 +10380,7 @@ test "fallbackFormatChat ChatML assistant with empty content and tool_calls" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false, true);
     defer allocator.free(result);
 
     // Empty content should not produce a blank line before <tool_call>
@@ -10362,7 +10412,7 @@ test "fallbackFormatChat multi-round tool calling" {
     };
     defer if (config.eos_token) |t| allocator.free(t);
 
-    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false);
+    const result = try fallbackFormatChat(allocator, &messages, &config, null, null, false, true);
     defer allocator.free(result);
 
     // Should have two <tool_call> blocks

@@ -20,6 +20,7 @@ const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
+const continuation_mod = @import("continuation.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
@@ -1347,6 +1348,9 @@ fn resolveReasoningProtocol(
 var global_response_store: ?responses_mod.ResponseStore = null;
 var global_response_store_gpa: ?std.mem.Allocator = null;
 const RESPONSE_STORE_CAP: usize = 256;
+var global_continuation_registry: ?continuation_mod.Registry = null;
+var global_continuation_mu: std.Io.Mutex = .init;
+const CONTINUATION_REGISTRY_CAP: usize = 2048;
 const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
 
 /// Default when an OpenAI-style client omits `max_tokens` /
@@ -1599,6 +1603,110 @@ fn deinitGlobalResponseStore() void {
         global_response_store_gpa = null;
     }
 }
+
+fn continuationBind(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    binding: continuation_mod.Binding,
+    frontier: continuation_mod.FrontierRef,
+) void {
+    global_continuation_mu.lockUncancelable(io);
+    defer global_continuation_mu.unlock(io);
+    if (global_continuation_registry == null) {
+        global_continuation_registry = continuation_mod.Registry.init(gpa, CONTINUATION_REGISTRY_CAP);
+    }
+    _ = global_continuation_registry.?.bind(binding, frontier) catch |err| {
+        log.warn("[live-cont] registry bind failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn continuationResolve(io: std.Io, binding: continuation_mod.Binding) ?continuation_mod.FrontierRef {
+    global_continuation_mu.lockUncancelable(io);
+    defer global_continuation_mu.unlock(io);
+    if (global_continuation_registry) |*registry| return registry.resolve(binding);
+    return null;
+}
+
+fn deinitGlobalContinuationRegistry(io: std.Io) void {
+    global_continuation_mu.lockUncancelable(io);
+    defer global_continuation_mu.unlock(io);
+    if (global_continuation_registry) |*registry| {
+        registry.deinit();
+        global_continuation_registry = null;
+    }
+}
+
+const ContinuationSubmit = struct {
+    model_tag: u64 = 0,
+    frontier_tag: ?u64 = null,
+    suffix: ?[]const u32 = null,
+};
+
+fn continuationFrontierForResult(
+    lm: *LoadedModel,
+    result: *const generate_mod.GenerationResult,
+    cache_key: u64,
+    visible_history: []const u32,
+) ?continuation_mod.FrontierRef {
+    const tag = result.continuation_frontier_tag orelse return null;
+    const hc = if (lm.prefix_cache) |*cache| cache else return null;
+    if (result.continuation_frontier_tokens == 0) return null;
+    return .{
+        .model_tag = hc.cacheInstanceTag(),
+        .entry_tag = tag,
+        .token_len = result.continuation_frontier_tokens,
+        .cache_key = cache_key,
+        .visible_hash = continuation_mod.tokenFingerprint(visible_history),
+        .visible_tokens = @intCast(visible_history.len),
+    };
+}
+
+fn tokenPrefix(full: []const u32, prefix: []const u32) bool {
+    return full.len >= prefix.len and std.mem.eql(u32, full[0..prefix.len], prefix);
+}
+
+fn responseVisibleHistoryIds(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    input_messages: []const chat_mod.Message,
+    visible_text: []const u8,
+    reasoning_text: ?[]const u8,
+    tool_calls: ?[]const chat_mod.ToolCall,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    reasoning_effort: ?[]const u8,
+) ![]u32 {
+    var assistant_content = std.ArrayList(u8).empty;
+    defer assistant_content.deinit(allocator);
+    if (reasoning_text) |reasoning| {
+        try assistant_content.appendSlice(allocator, "<think>");
+        try assistant_content.appendSlice(allocator, reasoning);
+        try assistant_content.appendSlice(allocator, "</think>");
+    }
+    try assistant_content.appendSlice(allocator, visible_text);
+
+    const history = try allocator.alloc(chat_mod.Message, input_messages.len + 1);
+    defer allocator.free(history);
+    @memcpy(history[0..input_messages.len], input_messages);
+    history[input_messages.len] = .{
+        .role = "assistant",
+        .content = assistant_content.items,
+        .tool_calls = tool_calls,
+    };
+    return chat_mod.formatChatHistory(
+        allocator,
+        tok,
+        history,
+        chat_config,
+        tools_json,
+        tool_choice_instruction,
+        enable_thinking,
+        reasoning_effort,
+    );
+}
+
 
 /// Start the HTTP server on the given host and port.
 ///
@@ -1968,6 +2076,7 @@ pub fn serve(
     }
 
     deinitGlobalResponseStore();
+    deinitGlobalContinuationRegistry(io);
 
     log.info("\nShutting down gracefully...\n", .{});
 }
@@ -9065,7 +9174,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, 0, cache_key, .{}, logprobs_n, null, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, 0, cache_key, .{}, logprobs_n, null, null, .{}, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -9403,6 +9512,7 @@ fn nonStreamingViaScheduler(
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     kv_attn_explicit: ?bool,
+    continuation: ContinuationSubmit,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -9434,6 +9544,9 @@ fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .vision_key = vision_key,
         .cache_key = cache_key,
+        .continuation_model_tag = continuation.model_tag,
+        .continuation_frontier_tag = continuation.frontier_tag,
+        .continuation_suffix = continuation.suffix,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -9678,7 +9791,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, .{}, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -15677,7 +15790,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, .{}, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -17260,6 +17373,51 @@ fn handleResponsesInner(
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
 
+    var response_continuation: ContinuationSubmit = .{};
+    if (prev_id) |pid| if (prev_messages) |history| {
+        if (vis_key == 0) {
+            const visible_history = chat_mod.formatChatHistory(
+                allocator,
+                tok,
+                history,
+                chat_config,
+                active_tools_json,
+                active_tool_choice_instruction,
+                enable_thinking,
+                reasoning_cfg.effort,
+            ) catch null;
+            if (visible_history) |history_ids| {
+                defer allocator.free(history_ids);
+                if (continuation_mod.make(.previous_response_id, pid)) |binding| {
+                    if (continuationResolve(stream.io, binding)) |frontier| {
+                        const model_ok = if (lm.prefix_cache) |*hc|
+                            frontier.model_tag == hc.cacheInstanceTag()
+                        else
+                            false;
+                        if (model_ok and
+                            continuation_mod.visibleMatches(frontier, history_ids) and
+                            tokenPrefix(prompt_ids, history_ids) and
+                            history_ids.len < prompt_ids.len)
+                        {
+                            response_continuation = .{
+                                .model_tag = frontier.model_tag,
+                                .frontier_tag = frontier.entry_tag,
+                                .suffix = prompt_ids[history_ids.len..],
+                            };
+                            log.info("[live-cont] Responses previous_response_id hit: frontier={d} visible={d} suffix={d}\n", .{
+                                frontier.token_len,
+                                history_ids.len,
+                                prompt_ids.len - history_ids.len,
+                            });
+                        } else {
+                            log.info("[live-cont] Responses previous_response_id declined: edited/stale visible history\n", .{});
+                        }
+                    }
+                }
+            }
+        }
+    };
+
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
@@ -17505,6 +17663,9 @@ fn handleResponsesInner(
             .vision_embeddings = slot_ve_resp,
             .vision_key = vis_key,
             .cache_key = cache_key,
+            .continuation_model_tag = response_continuation.model_tag,
+            .continuation_frontier_tag = response_continuation.frontier_tag,
+            .continuation_suffix = response_continuation.suffix,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
             .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
@@ -17806,6 +17967,11 @@ fn handleResponsesInner(
             .finish_reason = if (stopped) "stop" else ts.finish_reason,
             .prefill_tps = 0.0,
             .decode_tps = 0.0,
+            .prefill_ns = ts.prefill_ns,
+            .decode_ns = ts.decode_ns,
+            .cached_tokens = ts.cached_tokens,
+            .continuation_frontier_tag = ts.continuation_frontier_tag,
+            .continuation_frontier_tokens = ts.continuation_frontier_tokens,
             .finish_details = ts.finish_details,
         };
     } else {
@@ -17822,7 +17988,7 @@ fn handleResponsesInner(
             break :blk v;
         };
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, stream);
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, vis_key, cache_key, .{}, 0, kv_quant_override, kv_attn_explicit, response_continuation, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -17987,6 +18153,44 @@ fn handleResponsesInner(
         result.completion_tokens,
     );
     defer allocator.free(envelope);
+
+    // Register protocol ids only when this turn produced an exact retained
+    // frontier and a replayable visible transcript.
+    if (shouldParseToolCalls(result.finish_details) and result.continuation_frontier_tag != null) {
+        const stored_tool_calls_for_key: ?[]const chat_mod.ToolCall =
+            if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
+        const history_ids = responseVisibleHistoryIds(
+            allocator,
+            tok,
+            chat_config,
+            pi.messages.items,
+            visible_text,
+            reasoning_text,
+            stored_tool_calls_for_key,
+            active_tools_json,
+            active_tool_choice_instruction,
+            enable_thinking,
+            reasoning_cfg.effort,
+        ) catch null;
+        if (history_ids) |visible_history| {
+            defer allocator.free(visible_history);
+            if (continuationFrontierForResult(lm, &result, cache_key, visible_history)) |frontier| {
+                if (continuation_mod.make(.previous_response_id, resp_id)) |binding| {
+                    continuationBind(stream.io, allocator, binding, frontier);
+                }
+                for (emitted_tool_calls.items) |tc| {
+                    if (continuation_mod.make(.tool_call_id, tc.id)) |binding| {
+                        continuationBind(stream.io, allocator, binding, frontier);
+                    }
+                }
+                log.info("[live-cont] bound Responses frontier={d} visible={d} response_id=yes tool_ids={d}\n", .{
+                    frontier.token_len,
+                    visible_history.len,
+                    emitted_tool_calls.items.len,
+                });
+            }
+        }
+    }
 
     // ── store response ──
     if (should_store) {
