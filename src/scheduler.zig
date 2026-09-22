@@ -5191,14 +5191,19 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     const n_gen = gen_ptr.generated_ids.items.len;
     if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
 
-    // Construct the full token sequence: the original prompt + everything
-    // generated this turn. The cache reflects exactly this state — Generator
-    // forwarded each emitted token into slot.cache as it was sampled.
-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    // Construct the exact token sequence represented by the live state:
+    // prompt + visible generated tokens, plus a forwarded EOS/turn terminator.
+    // The terminator is cache identity only; API completion content/usage is
+    // unchanged, and exact-token lookup decides whether the next turn renders
+    // the same boundary token.
+    const terminal_len: usize = if (gen_ptr.frontier_terminal_id != null) 1 else 0;
+    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len + terminal_len;
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
+    const gen_end = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    @memcpy(total_tokens[slot.full_prompt.len..gen_end], gen_ptr.generated_ids.items);
+    if (gen_ptr.frontier_terminal_id) |terminal| total_tokens[gen_end] = terminal;
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-
@@ -5251,10 +5256,11 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         grown[ssm_cps_slice.len] = cp;
         cp_alloc.free(ssm_cps_slice);
         ssm_cps_slice = grown;
-        log.info("[hot-cache] decode frontier checkpoint @{d} (prompt={d}, generated={d})\n", .{
+        log.info("[hot-cache] decode frontier checkpoint @{d} (prompt={d}, generated={d}, terminal={s})\n", .{
             total_len,
             slot.full_prompt.len,
             n_gen,
+            if (gen_ptr.frontier_terminal_id != null) "yes" else "no",
         });
     } else if (decodeFrontierCheckpointEnabled() and n_gen > 0 and slot.ssm_entries != null) {
         log.debug("[hot-cache] decode frontier skipped (prompt={d}, generated={d}, moe_seq_offset={d}, total={d}, vision={x})\n", .{
@@ -6609,6 +6615,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            .decode_frontier_checkpoint = decodeFrontierCheckpointEnabled(),
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.
             .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)
@@ -7323,8 +7330,12 @@ test "hybrid decode frontier is captured only at an exact committed token positi
     // GDN trunks keep KVCache.step at zero; moe_seq_offset is the recurrent/token frontier.
     try testing.expect(std.mem.indexOf(u8, body, "slot.moe_seq_offset == total_len") != null);
     try testing.expect(std.mem.indexOf(u8, body, "slot.cache.step == total_len") == null);
-    // The frontier must describe the full committed prompt + generated tail.
+    // The frontier must describe the exact committed token identity. Natural
+    // EOS is forwarded but hidden from API content, so it rides the cache key
+    // as one terminal token and advances total_len by one.
     try testing.expect(std.mem.indexOf(u8, body, "captureSsmCheckpoint(") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "frontier_terminal_id") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "terminal_len") != null);
     try testing.expect(std.mem.indexOf(u8, body, "total_len,") != null);
     // Initial scope excludes media so pixel-key history cannot be conflated with text continuation.
     try testing.expect(std.mem.indexOf(u8, body, "slot.vision_key == 0") != null);
