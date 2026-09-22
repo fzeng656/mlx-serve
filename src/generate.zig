@@ -937,6 +937,9 @@ pub const GenerationResult = struct {
     /// is what was actually run through the model this turn, so `prefill_tps`
     /// reflects real compute rather than an inflated full-prompt rate.
     cached_tokens: u32 = 0,
+    /// Process-local exact hot-cache frontier produced by this generation.
+    continuation_frontier_tag: ?u64 = null,
+    continuation_frontier_tokens: u32 = 0,
     logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`

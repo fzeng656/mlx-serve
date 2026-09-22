@@ -135,6 +135,9 @@ pub const LookupResult = struct {
 };
 
 const Entry = struct {
+    /// Process-local opaque identity for protocol-bound live continuation.
+    /// Assigned only by HotPrefixCache; never derived from a client value.
+    frontier_tag: u64 = 0,
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
     /// Owned by the entry; freed on eviction.
     tokens: []u32,
@@ -385,6 +388,12 @@ pub const HotPrefixCache = struct {
     current_kv_bytes: u64,
     allocator: std.mem.Allocator,
     counter: u64 = 0,
+    /// Monotonic process-local identity for newly inserted entries. Replacement
+    /// of an append-only lineage preserves its tag.
+    next_frontier_tag: u64 = 1,
+    /// Tag of the exact entry affected by the most recent successful commit.
+    /// Null on decline. Consumed by the scheduler on the inference thread.
+    last_commit_tag: ?u64 = null,
     /// Set to true once we've called `xfm.resetCache()` at least once after
     /// init. The first commit on a fresh cache must seed an empty entry so
     /// future restores have something to land on.
@@ -416,6 +425,17 @@ pub const HotPrefixCache = struct {
     pending_disk: ?PendingDiskFlush = null,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
+
+    fn allocFrontierTag(self: *HotPrefixCache) u64 {
+        const tag = self.next_frontier_tag;
+        self.next_frontier_tag +%= 1;
+        if (self.next_frontier_tag == 0) self.next_frontier_tag = 1;
+        return tag;
+    }
+
+    pub fn lastCommittedFrontierTag(self: *const HotPrefixCache) ?u64 {
+        return self.last_commit_tag;
+    }
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -1532,6 +1552,7 @@ pub const HotPrefixCache = struct {
         mtp: ?DflashCommit,
         prompt_len: usize,
     ) !CommitStatus {
+        self.last_commit_tag = null;
         const quant_config = source_cache.config;
 
         // Record what the live cache holds now, before any byte-budget trim.
@@ -1664,6 +1685,7 @@ pub const HotPrefixCache = struct {
                             @as(f64, @floatFromInt(new_bytes)) / (1024.0 * 1024.0),
                             @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
                         });
+                        self.last_commit_tag = self.entries.items[idx].frontier_tag;
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
@@ -1960,6 +1982,7 @@ pub const HotPrefixCache = struct {
                 }
             }
             if (self.disk != null) self.disk_dirty = true;
+            self.last_commit_tag = e.frontier_tag;
             self.logResident();
             return .{ .ok = eff_tokens.len };
         }
@@ -1981,7 +2004,9 @@ pub const HotPrefixCache = struct {
                 eff_cps = null;
             }
         }
+        const frontier_tag = self.allocFrontierTag();
         self.entries.append(self.allocator, .{
+            .frontier_tag = frontier_tag,
             .tokens = tokens_owned,
             .has_tools = has_tools,
             .vision_key = eff_vision_key,
@@ -2017,6 +2042,14 @@ pub const HotPrefixCache = struct {
         // remains successful.
         self.enforceCapsAfterAppend();
         if (self.disk != null) self.disk_dirty = true;
+        // The entry may have been evicted by enforceCapsAfterAppend(). Only
+        // publish a tag if the newly inserted entry is still resident.
+        for (self.entries.items) |*entry| {
+            if (entry.frontier_tag == frontier_tag) {
+                self.last_commit_tag = frontier_tag;
+                break;
+            }
+        }
         self.logResident();
         return .{ .ok = eff_tokens.len };
     }

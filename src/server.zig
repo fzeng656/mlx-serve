@@ -9524,6 +9524,8 @@ fn nonStreamingViaScheduler(
         .prefill_ns = slot.prefill_ns,
         .decode_ns = slot.decode_ns,
         .cached_tokens = slot.cached_tokens,
+        .continuation_frontier_tag = slot.committed_frontier_tag,
+        .continuation_frontier_tokens = slot.committed_frontier_tokens,
         .logprobs = logprobs_slice,
         .finish_details = slot.finish_details,
         .constraint_payload_byte = constraint_payload_byte,
@@ -9972,6 +9974,8 @@ const StreamingTokenStream = struct {
     /// `timings` block from the usage chunk).
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
+    continuation_frontier_tag: ?u64 = null,
+    continuation_frontier_tokens: u32 = 0,
 
     fn init(gen: *Generator, mode: StreamMode, pld_draft_len: u32, pld_key_len: u32, eos: []const u32) StreamingTokenStream {
         return .{
@@ -10011,6 +10015,8 @@ const StreamingTokenStream = struct {
             self.finish_details = s.finish_details;
             self.prefill_ns = s.prefill_ns;
             self.decode_ns = s.decode_ns;
+            self.continuation_frontier_tag = s.committed_frontier_tag;
+            self.continuation_frontier_tokens = s.committed_frontier_tokens;
         } else if (self.gen) |g| {
             self.prompt_tokens = g.prompt_tokens;
             self.completion_tokens = g.completion_tokens;

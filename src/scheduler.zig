@@ -470,6 +470,10 @@ pub const Slot = struct {
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64 = 0,
+    /// Exact RAM hot-cache frontier committed by this turn when the full
+    /// model state was retained without a byte-budget trim or decline.
+    committed_frontier_tag: ?u64 = null,
+    committed_frontier_tokens: u32 = 0,
     skip_prefix_cache: bool = false,
     /// First dynamic image/audio/video placeholder in `full_prompt`. Cache
     /// state before this position is safe to share across media hashes.
@@ -707,6 +711,8 @@ pub const Slot = struct {
             .vision_embeddings = params.vision_embeddings,
             .vision_key = params.vision_key,
             .cache_key = params.cache_key,
+            .committed_frontier_tag = null,
+            .committed_frontier_tokens = 0,
             .media_start = media_start,
             .mrope_pos = params.mrope_pos,
             .mrope_total = params.mrope_total,
@@ -5379,9 +5385,17 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         return;
     };
     publishHotCacheResidency(sch);
-    // The decline paths already log their reason inside the cache; a silent
-    // `_ =` here is fine — this caller has no commit-shaped log to lie about.
-    _ = finish_st;
+    // Publish only an exact full frontier. A trimmed or declined commit stays
+    // useful for ordinary prefix reuse but cannot authorize divergent replay.
+    switch (finish_st) {
+        .ok => |committed| {
+            if (committed == total_len) {
+                slot.committed_frontier_tag = hc.lastCommittedFrontierTag();
+                slot.committed_frontier_tokens = @intCast(committed);
+            }
+        },
+        else => {},
+    }
 }
 
 /// Logical committed length for a cancelled-prefill commit: the tokens
