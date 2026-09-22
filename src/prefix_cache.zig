@@ -3782,6 +3782,76 @@ test "HotPrefixCache: hybrid lookup reuses only the prefix before changed media"
 // sit just AFTER that boundary. An older entry for the same pixels may have a
 // slightly shorter token match with a usable checkpoint. Picking by raw token
 // match alone turns that recoverable case into a full cold prefill.
+test "HotPrefixCache: decode frontier wins append-only reuse and loses after divergence" {
+    const s = mlx.gpuStream();
+    const committed = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const appended = committed ++ [_]u32{ 13, 14 };
+    const diverged = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 90, 91, 92, 93, 13, 14 };
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+
+    var source_cache = try KVCache.init(testing.allocator, 3);
+    defer source_cache.deinit();
+    try testFillCache(&source_cache, s, 3, committed.len);
+
+    // cp@8 models the ordinary end-of-prompt checkpoint; cp@12 models the
+    // decode frontier added after the assistant generated four more tokens.
+    var prompt_state = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&prompt_state);
+    var frontier_state = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&frontier_state);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &prompt_state, 8, s);
+    cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &frontier_state, 12, s);
+    _ = try hc.commitWithState(&source_cache, &committed, false, 0, cps, null, null);
+
+    // Exact append-only continuation reaches the frontier: the generated tail
+    // is not replayed.
+    var append_cache = try KVCache.init(testing.allocator, 3);
+    defer append_cache.deinit();
+    var append_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&append_ssm);
+    var append_off: usize = 0;
+    const warm = try hc.lookupAndRestore(
+        &append_cache,
+        &append_off,
+        &append_ssm,
+        s,
+        &appended,
+        false,
+        0,
+        null,
+        null,
+    );
+    try testing.expectEqual(@as(usize, 12), warm.matched);
+    try testing.expectEqual(@as(usize, 12), append_off);
+    try testing.expectEqual(@as(f32, 300.0), pcSsmVal(append_ssm[0].conv_state, 0, s));
+
+    // If history is re-rendered/edited before the frontier, raw token identity
+    // remains authoritative. cp@12 is unreachable and the older safe cp@8
+    // must win.
+    var diverged_cache = try KVCache.init(testing.allocator, 3);
+    defer diverged_cache.deinit();
+    var diverged_ssm = pcEmptySsm();
+    defer pcFreeHybrid(&diverged_ssm);
+    var diverged_off: usize = 0;
+    const fallback = try hc.lookupAndRestore(
+        &diverged_cache,
+        &diverged_off,
+        &diverged_ssm,
+        s,
+        &diverged,
+        false,
+        0,
+        null,
+        null,
+    );
+    try testing.expectEqual(@as(usize, 8), fallback.matched);
+    try testing.expectEqual(@as(usize, 8), diverged_off);
+    try testing.expectEqual(@as(f32, 100.0), pcSsmVal(diverged_ssm[0].conv_state, 0, s));
+}
+
 test "HotPrefixCache: hybrid lookup falls back to the best restorable RAM entry" {
     const s = mlx.gpuStream();
     const vision_key: u64 = 0xdecaf;
