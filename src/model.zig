@@ -3617,15 +3617,39 @@ fn jsonFloat(v: std.json.Value) f32 {
     };
 }
 
+/// Explicit routed-expert mmap policy. Off by default; production opts in
+/// with --mmap-routed-experts. The scheduler scopes it to Qwen4 loads only.
+pub var mmap_routed_experts_policy: bool = false;
+pub var mmap_routed_experts_on_load: bool = false;
+
+pub fn mmapRoutedExpertsPolicyEnabled() bool {
+    if (!mmap_routed_experts_policy) return false;
+    if (std.c.getenv("MLX_SERVE_MMAP_EXPERTS")) |v|
+        return !std.mem.eql(u8, std.mem.span(v), "0");
+    return true;
+}
+
+fn mmapRoutedExpertsEnabled() bool {
+    return mmap_routed_experts_on_load and mmapRoutedExpertsPolicyEnabled();
+}
+
+fn isMmapRoutedExpertKey(key: []const u8) bool {
+    return std.mem.indexOf(u8, key, ".mlp.switch_mlp.") != null;
+}
+
 /// Holds all loaded weights as mlx arrays, keyed by name.
 pub const Weights = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
+    mmap_shards: std.ArrayList(*mlx.msv_mmap_shard),
+    mmap_tensor_count: usize = 0,
+    mmap_tensor_bytes: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Weights {
         return .{
             .map = std.StringHashMap(mlx.mlx_array).init(allocator),
             .allocator = allocator,
+            .mmap_shards = .empty,
         };
     }
 
@@ -3636,6 +3660,8 @@ pub const Weights = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.map.deinit();
+        for (self.mmap_shards.items) |shard| mlx.msv_mmap_shard_close(shard);
+        self.mmap_shards.deinit(self.allocator);
     }
 
     pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
@@ -3733,7 +3759,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, mmap_io: ?std.Io = null };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
@@ -3808,7 +3834,9 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s, opts);
+        var file_opts = opts;
+        file_opts.mmap_io = io;
+        try loadSafetensorsFile(allocator, &weights, path, s, file_opts);
         file_count += 1;
     }
 
@@ -3826,6 +3854,13 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     }
 
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
+    if (weights.mmap_tensor_count > 0) {
+        log.info("[mmap] routed experts: {d} tensors, {d:.2} GB file-backed across {d} shard(s)\n", .{
+            weights.mmap_tensor_count,
+            @as(f64, @floatFromInt(weights.mmap_tensor_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            weights.mmap_shards.items.len,
+        });
+    }
     reportF16Narrowing();
     return weights;
 }
@@ -3894,6 +3929,79 @@ pub fn reportF16Narrowing() void {
     narrowed_1d = 0;
 }
 
+const MmapSafetensorsHeader = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    data_base: usize,
+
+    fn deinit(self: *MmapSafetensorsHeader) void {
+        self.parsed.deinit();
+    }
+
+    fn absoluteOffset(self: *const MmapSafetensorsHeader, key: []const u8) ?usize {
+        if (self.parsed.value != .object) return null;
+        const rec = self.parsed.value.object.get(key) orelse return null;
+        if (rec != .object) return null;
+        const offs = rec.object.get("data_offsets") orelse return null;
+        if (offs != .array or offs.array.items.len != 2) return null;
+        const first = offs.array.items[0];
+        if (first != .integer or first.integer < 0) return null;
+        const rel: usize = @intCast(first.integer);
+        if (rel > std.math.maxInt(usize) - self.data_base) return null;
+        return self.data_base + rel;
+    }
+};
+
+fn readMmapSafetensorsHeader(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !MmapSafetensorsHeader {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const header_len_u64 = try rs.interface.takeInt(u64, .little);
+    if (header_len_u64 == 0 or header_len_u64 > 100_000_000) return error.InvalidSafetensorsHeader;
+    const header_len: usize = @intCast(header_len_u64);
+    const header = try allocator.alloc(u8, header_len);
+    defer allocator.free(header);
+    try rs.interface.readSliceAll(header);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, header, .{});
+    return .{ .parsed = parsed, .data_base = 8 + header_len };
+}
+
+pub fn estimateMmapRoutedExpertBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) u64 {
+    if (!mmapRoutedExpertsPolicyEnabled()) return 0;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var referenced = model_discovery.indexShardSet(io, dir);
+    defer if (referenced) |*r| model_discovery.freeShardSet(r);
+
+    var total: u64 = 0;
+    var saw_any = false;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, entry.name }) catch return 0;
+        defer allocator.free(path);
+        var h = readMmapSafetensorsHeader(io, allocator, path) catch return 0;
+        defer h.deinit();
+        if (h.parsed.value != .object) return 0;
+        var hit = h.parsed.value.object.iterator();
+        while (hit.next()) |rec| {
+            if (!isMmapRoutedExpertKey(rec.key_ptr.*)) continue;
+            const v = rec.value_ptr.*;
+            if (v != .object) return 0;
+            const offs = v.object.get("data_offsets") orelse return 0;
+            if (offs != .array or offs.array.items.len != 2) return 0;
+            const a = offs.array.items[0];
+            const b = offs.array.items[1];
+            if (a != .integer or b != .integer or a.integer < 0 or b.integer < a.integer) return 0;
+            total +|= @intCast(b.integer - a.integer);
+            saw_any = true;
+        }
+    }
+    return if (saw_any) total else 0;
+}
+
 pub fn loadSafetensorsFile(
     allocator: std.mem.Allocator,
     weights: *Weights,
@@ -3909,6 +4017,19 @@ pub fn loadSafetensorsFile(
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
     try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
+
+    var mmap_header: ?MmapSafetensorsHeader = null;
+    defer if (mmap_header) |*h| h.deinit();
+    if (mmapRoutedExpertsEnabled()) {
+        if (opts.mmap_io) |io| {
+            mmap_header = readMmapSafetensorsHeader(io, allocator, std.mem.span(path)) catch |err| blk: {
+                log.warn("[mmap] safetensors header fallback for {s}: {s}\n", .{ std.mem.span(path), @errorName(err) });
+                break :blk null;
+            };
+        }
+    }
+    var mmap_shard: ?*mlx.msv_mmap_shard = null;
+    var mmap_file_disabled = false;
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
@@ -3928,6 +4049,38 @@ pub fn loadSafetensorsFile(
         if (!shouldKeepWeightKey(key_str, load_vision)) {
             _ = mlx.mlx_array_free(value);
             continue;
+        }
+
+        if (!mmap_file_disabled and isMmapRoutedExpertKey(key_str)) mmap_try: {
+            const h = &(mmap_header orelse break :mmap_try);
+            const abs_off = h.absoluteOffset(key_str) orelse break :mmap_try;
+            if (mmap_shard == null) {
+                var sh: *mlx.msv_mmap_shard = undefined;
+                if (mlx.msv_mmap_shard_open(&sh, path) != 0) {
+                    log.warn("[mmap] shard fallback for {s}: {s}\n", .{ std.mem.span(path), std.mem.span(mlx.msv_mmap_last_error()) });
+                    mmap_file_disabled = true;
+                    break :mmap_try;
+                }
+                weights.mmap_shards.append(allocator, sh) catch |err| {
+                    mlx.msv_mmap_shard_close(sh);
+                    return err;
+                };
+                mmap_shard = sh;
+            }
+            const ndim = mlx.mlx_array_ndim(value);
+            const shape = mlx.mlx_array_shape(value);
+            const dtype = mlx.mlx_array_dtype(value);
+            var mapped = mlx.mlx_array_new();
+            if (mlx.msv_mmap_shard_array(&mapped, mmap_shard.?, abs_off, shape, @intCast(ndim), dtype) != 0) {
+                _ = mlx.mlx_array_free(mapped);
+                log.warn("[mmap] tensor fallback {s}: {s}\n", .{ key_str, std.mem.span(mlx.msv_mmap_last_error()) });
+                mmap_file_disabled = true;
+                break :mmap_try;
+            }
+            _ = mlx.mlx_array_free(value);
+            value = mapped;
+            weights.mmap_tensor_count += 1;
+            weights.mmap_tensor_bytes += @as(u64, @intCast(mlx.mlx_array_size(mapped))) * @as(u64, @intCast(mlx.mlx_array_itemsize(mapped)));
         }
 
         // Read the shape BEFORE the cast frees `value` — a freed handle's
