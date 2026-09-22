@@ -25,6 +25,7 @@ test {
     _ = @import("json_grammar.zig");
     _ = @import("token_mask.zig");
     _ = @import("responses.zig");
+    _ = @import("continuation.zig");
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
     _ = @import("kv_quant.zig");
