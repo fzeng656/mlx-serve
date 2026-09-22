@@ -157,6 +157,11 @@ const Entry = struct {
     snapshot: KVCacheSnapshot,
     /// Monotonic counter for LRU. Higher = more recent.
     last_used: u64,
+    /// Number of RAM-prefix restores this lineage has actually served. A long-lived
+    /// agent session quickly becomes >0 while one-shot worker/cache-sweep entries
+    /// normally stay at 0. Used only as an eviction tie-break between workloads;
+    /// it never changes cache correctness or lookup eligibility.
+    reuse_hits: u32 = 0,
     /// Wave 1.A: full KV-quant config active when this entry was committed.
     /// A new request whose `KVQuantConfig` differs in any field cannot
     /// restore from this entry — the underlying buffer layout (dense bf16 vs
@@ -1265,6 +1270,7 @@ pub const HotPrefixCache = struct {
         }
         const used_before_restore = e.last_used;
         e.last_used = self.bumpCounter();
+        if (e.reuse_hits != std.math.maxInt(u32)) e.reuse_hits += 1;
         // Identity of the entry this request runs on: evicting it frees nothing (shared buffers).
         self.last_restored_used = e.last_used;
 
@@ -1869,6 +1875,7 @@ pub const HotPrefixCache = struct {
 
         if (replace_idx) |idx| {
             const e = &self.entries.items[idx];
+            const same_cache_key = e.cache_key == cache_key;
 
             // Phase 1: SSM checkpoint inheritance on prefix-extend. The
             // replace path triggers when the new entry's tokens fully
@@ -1917,6 +1924,7 @@ pub const HotPrefixCache = struct {
             e.has_tools = has_tools;
             e.vision_key = eff_vision_key;
             e.cache_key = cache_key;
+            if (!same_cache_key) e.reuse_hits = 0;
             e.media_start = eff_media_start;
             e.quant_config = quant_config;
             e.kv_bytes = new_kv_bytes + merged_ssm_bytes + new_dflash_bytes + new_mtp_bytes;
@@ -1956,15 +1964,14 @@ pub const HotPrefixCache = struct {
             return .{ .ok = eff_tokens.len };
         }
 
-        while (self.entries.items.len >= self.max_entries) {
-            if (!self.evictOneLruProgress("count cap", cache_key)) break;
-        }
-        if (self.max_kv_bytes > 0) {
-            while (self.current_kv_bytes + new_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-                if (!self.evictOneLruProgress("byte budget", cache_key)) break;
-            }
-        }
-
+        // Admit first, THEN choose the victim.  Pre-evicting here makes the
+        // incoming workload invisible to the policy: with one established
+        // 100k agent entry and a first-time 30k worker, the only resident
+        // candidate is the agent, so even reuse-aware ranking has no choice
+        // but to destroy it.  The incoming snapshot already exists at this
+        // point (commit only transfers ownership/refcounts), so temporarily
+        // exceeding the accounting cap does not allocate another model-sized
+        // buffer.  Once appended, fair eviction can reject the newcomer itself.
         if (eff_cps) |cps| {
             if (self.takeCpsIfQsaBank(cps)) |kept| {
                 eff_cps = kept;
@@ -2003,8 +2010,12 @@ pub const HotPrefixCache = struct {
             return err;
         };
         self.current_kv_bytes += new_bytes;
-        // The trim prices a prefix against the checkpoints that survive a shed, so the shed runs here too.
-        if (self.max_kv_bytes > 0) self.shedCheckpointsToFit();
+
+        // Now the incoming entry participates in workload/reuse/size ranking.
+        // It is valid for this enforcement to evict the entry we just appended:
+        // that means cache admission was declined while generation itself
+        // remains successful.
+        self.enforceCapsAfterAppend();
         if (self.disk != null) self.disk_dirty = true;
         self.logResident();
         return .{ .ok = eff_tokens.len };
@@ -2610,6 +2621,26 @@ pub const HotPrefixCache = struct {
         self.logResident();
     }
 
+    /// Enforce count/byte caps AFTER a newcomer has been appended so the
+    /// newcomer itself is a valid eviction candidate.  This is cache admission,
+    /// not generation admission: rejecting a one-shot worker here must never
+    /// destroy a more valuable long-running agent session just because the
+    /// worker arrived second.
+    fn enforceCapsAfterAppend(self: *HotPrefixCache) void {
+        while (self.entries.items.len > self.max_entries and self.entries.items.len > 0) {
+            self.evictOneLru("count cap", null);
+        }
+        if (self.max_kv_bytes == 0) return;
+        while (self.current_kv_bytes > self.max_kv_bytes and self.entries.items.len > 1) {
+            self.evictOneLru("byte budget", null);
+        }
+        // A sole oversize entry may fit after dropping optional SSM checkpoints.
+        self.shedCheckpointsToFit();
+        while (self.current_kv_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
+            self.evictOneLru("byte budget", null);
+        }
+    }
+
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
         const idx = self.lruIndexExcluding(null, incoming_key) orelse return;
         self.evictAt(idx, reason);
@@ -2839,13 +2870,18 @@ pub const HotPrefixCache = struct {
     }
 
     /// Least-recently-used entry index, skipping the one whose `last_used` equals `protect`.
-    /// Workload-fair: only entries of the `cache_key` holding the most eligible entries
-    /// (`incoming_key` counts as one more) are candidates, so a sweep evicts its own
-    /// documents before another workload's conversation. One key = plain LRU.
+    /// Workload-fair: the key holding the most eligible entries pays first (`incoming_key`
+    /// counts as one more), so a sweep evicts its own documents before another workload's
+    /// conversation. When multiple workload keys tie on count (the normal OpenClaw shape:
+    /// one cache key per agent session), evict the least-established workload first, then
+    /// the cheaper-to-rebuild one, and only then fall back to LRU. Within a single workload
+    /// all group stats are identical, preserving the old plain-LRU behavior.
     fn lruIndexExcluding(self: *const HotPrefixCache, protect: ?u64, incoming_key: ?u64) ?usize {
         var best: ?usize = null;
         var best_used: u64 = std.math.maxInt(u64);
-        var max_count: usize = 0;
+        var best_count: usize = 0;
+        var best_reuse: u64 = std.math.maxInt(u64);
+        var best_tokens: usize = std.math.maxInt(usize);
         for (self.entries.items, 0..) |*e, i| {
             // Held by a live slot that owns its buffers: evicting it frees nothing.
             if (e.checked_out_by != null) continue;
@@ -2853,15 +2889,26 @@ pub const HotPrefixCache = struct {
                 if (e.last_used == p) continue;
             }
             var count: usize = if (incoming_key != null and incoming_key.? == e.cache_key) 1 else 0;
+            var group_reuse: u64 = 0;
+            var group_tokens: usize = 0;
             for (self.entries.items) |*o| {
                 if (o.checked_out_by != null or o.cache_key != e.cache_key) continue;
                 if (protect) |p| {
                     if (o.last_used == p) continue;
                 }
                 count += 1;
+                group_reuse += @as(u64, o.reuse_hits);
+                group_tokens += o.tokens.len;
             }
-            if (count > max_count or (count == max_count and e.last_used < best_used)) {
-                max_count = count;
+            if (best == null or
+                count > best_count or
+                (count == best_count and group_reuse < best_reuse) or
+                (count == best_count and group_reuse == best_reuse and group_tokens < best_tokens) or
+                (count == best_count and group_reuse == best_reuse and group_tokens == best_tokens and e.last_used < best_used))
+            {
+                best_count = count;
+                best_reuse = group_reuse;
+                best_tokens = group_tokens;
                 best_used = e.last_used;
                 best = i;
             }
@@ -8795,4 +8842,87 @@ test "HotPrefixCache: eviction picks the LRU of the key holding the most entries
     // One workload = plain LRU: C goes first.
     for (cache.entries.items) |*e| e.cache_key = 0;
     try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
+}
+
+test "HotPrefixCache: equal-size workload tie protects a reused long agent session" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+
+    const main_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const worker_a_tokens = [_]u32{ 9, 10 };
+    const worker_b_tokens = [_]u32{ 11, 12, 13 };
+    const token_sets = [_][]const u32{ &main_tokens, &worker_a_tokens, &worker_b_tokens };
+    const keys = [_]u64{ 0xa, 0xb, 0xc };
+    for (keys, 0..) |key, i| {
+        const toks: []const u32 = token_sets[i];
+        try cache.entries.append(testing.allocator, .{
+            .tokens = try testing.allocator.dupe(u32, toks),
+            .has_tools = false,
+            .cache_key = key,
+            .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+            .last_used = i + 1,
+            .reuse_hits = if (i == 0) 4 else 0,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 0,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        });
+    }
+
+    // Three distinct OpenClaw session keys all hold one entry. The old #378
+    // tie-break was global LRU and evicted index 0 (the established main
+    // conversation). Reuse affinity keeps it and evicts the one-shot worker.
+    try testing.expectEqual(@as(?usize, 1), cache.lruIndexExcluding(null, 0xd));
+
+    // Before a session proves reuse, keep the more expensive long prefix and
+    // rebuild the shorter one; this still avoids throwing away a 200k prefix
+    // for a tiny worker request on the main session's first follow-up.
+    for (cache.entries.items) |*e| e.reuse_hits = 0;
+    try testing.expectEqual(@as(?usize, 1), cache.lruIndexExcluding(null, 0xd));
+
+    // A single workload remains exactly plain LRU, preserving #378 semantics.
+    for (cache.entries.items) |*e| e.cache_key = 0;
+    try testing.expectEqual(@as(?usize, 0), cache.lruIndexExcluding(null, 0));
+}
+
+test "HotPrefixCache: first-time worker is rejected after append instead of evicting reused main" {
+    var cache = HotPrefixCache.init(testing.allocator, 8);
+    defer cache.deinit();
+    cache.max_kv_bytes = 4096;
+
+    const main_key: u64 = 0xa;
+    const worker_key: u64 = 0xb;
+    const main_tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const worker_tokens = [_]u32{ 90, 91 };
+
+    try cache.entries.append(testing.allocator, .{
+        .tokens = try testing.allocator.dupe(u32, &main_tokens),
+        .has_tools = false,
+        .cache_key = main_key,
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .last_used = 1,
+        .reuse_hits = 4,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = 3500,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+    try cache.entries.append(testing.allocator, .{
+        .tokens = try testing.allocator.dupe(u32, &worker_tokens),
+        .has_tools = false,
+        .cache_key = worker_key,
+        .snapshot = .{ .entries = try testing.allocator.alloc(transformer_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = transformer_mod.KVQuantConfig.dense },
+        .last_used = 2,
+        .reuse_hits = 0,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = 1200,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+    cache.current_kv_bytes = 4700;
+
+    cache.enforceCapsAfterAppend();
+    try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try testing.expectEqual(main_key, cache.entries.items[0].cache_key);
+    try testing.expectEqual(@as(u64, 3500), cache.current_kv_bytes);
 }
