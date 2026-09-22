@@ -1313,6 +1313,16 @@ pub const Generator = struct {
     // Deferred token: lazy array from async pipeline, eval'd at start of next iteration
     pending_token: mlx.mlx_array = .{},
     has_pending_token: bool = false,
+    /// Prefix-cache decode-frontier mode. On the regular lazy pipeline this
+    /// resolves the already-forwarded lookahead before dispatching another
+    /// forward, so an EOS can stop at its exact recurrent frontier instead of
+    /// leaving one post-EOS token in the live state.
+    decode_frontier_checkpoint: bool = false,
+    /// EOS/turn terminator that was forwarded into the model but deliberately
+    /// not exposed as completion content. When set, commitSlotIfApplicable
+    /// includes this token in the cache key so state position and token
+    /// identity remain exact.
+    frontier_terminal_id: ?u32 = null,
 
     // ── Spec-decode shared state (PLD + drafter) ──
     // Post-final-norm hidden state at the last produced token's position.
@@ -2072,6 +2082,9 @@ pub const Generator = struct {
         /// behavior to the regular sampling path. Has no effect when
         /// `pld_enabled` or `drafter_enabled` is true.
         skip_lazy_preforward: bool = false,
+        /// Preserve an exact regular-decode frontier for hot-cache commits.
+        /// The scheduler enables this with MLX_SERVE_DECODE_FRONTIER_CP.
+        decode_frontier_checkpoint: bool = false,
         /// Phase 1 (performance-plan): during prefill, capture an SSM
         /// checkpoint every `ssm_checkpoint_stride` tokens. 0 = disabled.
         /// Snapshots land in `Generator.ssm_checkpoints` for the caller to
@@ -3211,6 +3224,7 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
+                .decode_frontier_checkpoint = options.decode_frontier_checkpoint,
             };
             attachCp(&gen, &ssm_checkpoints, allocator);
             return gen;
@@ -10467,6 +10481,19 @@ pub const Generator = struct {
         if (self.done) return null;
         if (self.sampling.constraint != null) return self.nextConstrained(allocator);
 
+        // In frontier mode, resolve the already-forwarded pending token before
+        // dispatching another lazy lookahead. If it is EOS, the live state is
+        // exactly after that terminator; do not run one token past it.
+        if (self.decode_frontier_checkpoint and self.has_pending_token and self.has_pending_logits) {
+            try self.resolvePendingToken();
+            if (isEosId(self.next_token_id, self.eos_token_ids)) {
+                self.frontier_terminal_id = self.next_token_id;
+                self.done = true;
+                self.finish_reason = "stop";
+                return null;
+            }
+        }
+
         // Transition shim: speculative-decode paths may exit with
         // `next_token_id` set but `pending_logits` unset (drafter's exit
         // invariant is "t1 NOT in cache" — its hand-off to `next()` would
@@ -10990,6 +11017,19 @@ pub const Generator = struct {
 
         return token;
     }
+
+test "decode frontier resolves a pending EOS before dispatching another lazy forward" {
+    const source = @embedFile("generate.zig");
+    const start = std.mem.indexOf(u8, source, "pub fn next(self: *Generator") orelse return error.MissingNext;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "/// Check all stop conditions") orelse return error.MissingCheckStop;
+    const body = source[start..end];
+
+    const frontier = std.mem.indexOf(u8, body, "if (self.decode_frontier_checkpoint and self.has_pending_token and self.has_pending_logits)") orelse return error.MissingFrontierGate;
+    const lazy = std.mem.indexOf(u8, body, "if (self.has_pending_logits and self.logprobs_n == 0") orelse return error.MissingLazyPipeline;
+    try std.testing.expect(frontier < lazy);
+    try std.testing.expect(std.mem.indexOf(u8, body, "self.frontier_terminal_id = self.next_token_id;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "if (isEosId(self.next_token_id, self.eos_token_ids))") != null);
+}
 
     /// Check all stop conditions. Returns true if generation should stop.
     pub fn checkStop(self: *Generator) !bool {
