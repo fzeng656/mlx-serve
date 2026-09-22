@@ -5214,8 +5214,9 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // recurrent state needs the same frontier checkpoint or the next
     // append-only turn must replay the whole previous answer.
     //
-    // Safety contract: only stamp total_len when the live attention cache says
-    // it is at exactly that position. Any speculative/pipeline skew declines
+    // Safety contract: only stamp total_len when the hybrid sequence frontier
+    // (moe_seq_offset; GDN keeps KVCache.step at 0) is exactly there. Any
+    // speculative/pipeline skew declines
     // this optimization and leaves the upstream checkpoint path untouched.
     // Text-only first: media history has an independent pixel-key boundary and
     // is deliberately left on the existing path for the initial A/B.
@@ -5223,7 +5224,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         n_gen > 0 and
         slot.vision_key == 0 and
         slot.ssm_entries != null and
-        slot.cache.step == total_len)
+        slot.moe_seq_offset == total_len)
     frontier_cp: {
         const cp_alloc = gen_ptr.ssm_checkpoint_alloc orelse break :frontier_cp;
         const xfm = slot.model.transformer orelse break :frontier_cp;
@@ -5251,10 +5252,10 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             n_gen,
         });
     } else if (decodeFrontierCheckpointEnabled() and n_gen > 0 and slot.ssm_entries != null) {
-        log.debug("[hot-cache] decode frontier skipped (prompt={d}, generated={d}, cache.step={d}, total={d}, vision={x})\n", .{
+        log.debug("[hot-cache] decode frontier skipped (prompt={d}, generated={d}, moe_seq_offset={d}, total={d}, vision={x})\n", .{
             slot.full_prompt.len,
             n_gen,
-            slot.cache.step,
+            slot.moe_seq_offset,
             total_len,
             slot.vision_key,
         });
@@ -7314,8 +7315,9 @@ test "hybrid decode frontier is captured only at an exact committed token positi
 
     // The feature is opt-in for the first production A/B.
     try testing.expect(std.mem.indexOf(u8, body, "decodeFrontierCheckpointEnabled()") != null);
-    // Never label a recurrent state with a token position the live KV has not reached.
-    try testing.expect(std.mem.indexOf(u8, body, "slot.cache.step == total_len") != null);
+    // GDN trunks keep KVCache.step at zero; moe_seq_offset is the recurrent/token frontier.
+    try testing.expect(std.mem.indexOf(u8, body, "slot.moe_seq_offset == total_len") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.cache.step == total_len") == null);
     // The frontier must describe the full committed prompt + generated tail.
     try testing.expect(std.mem.indexOf(u8, body, "captureSsmCheckpoint(") != null);
     try testing.expect(std.mem.indexOf(u8, body, "total_len,") != null);
