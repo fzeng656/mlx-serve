@@ -1642,23 +1642,39 @@ const ContinuationSubmit = struct {
     suffix: ?[]const u32 = null,
 };
 
+fn continuationFrontierFromExact(
+    lm: *LoadedModel,
+    frontier_tag: ?u64,
+    frontier_tokens: u32,
+    cache_key: u64,
+    visible_history: []const u32,
+) ?continuation_mod.FrontierRef {
+    const tag = frontier_tag orelse return null;
+    const hc = if (lm.prefix_cache) |*cache| cache else return null;
+    if (frontier_tokens == 0) return null;
+    return .{
+        .model_tag = hc.cacheInstanceTag(),
+        .entry_tag = tag,
+        .token_len = frontier_tokens,
+        .cache_key = cache_key,
+        .visible_hash = continuation_mod.tokenFingerprint(visible_history),
+        .visible_tokens = @intCast(visible_history.len),
+    };
+}
+
 fn continuationFrontierForResult(
     lm: *LoadedModel,
     result: *const generate_mod.GenerationResult,
     cache_key: u64,
     visible_history: []const u32,
 ) ?continuation_mod.FrontierRef {
-    const tag = result.continuation_frontier_tag orelse return null;
-    const hc = if (lm.prefix_cache) |*cache| cache else return null;
-    if (result.continuation_frontier_tokens == 0) return null;
-    return .{
-        .model_tag = hc.cacheInstanceTag(),
-        .entry_tag = tag,
-        .token_len = result.continuation_frontier_tokens,
-        .cache_key = cache_key,
-        .visible_hash = continuation_mod.tokenFingerprint(visible_history),
-        .visible_tokens = @intCast(visible_history.len),
-    };
+    return continuationFrontierFromExact(
+        lm,
+        result.continuation_frontier_tag,
+        result.continuation_frontier_tokens,
+        cache_key,
+        visible_history,
+    );
 }
 
 fn tokenPrefix(full: []const u32, prefix: []const u32) bool {
@@ -1705,6 +1721,193 @@ fn responseVisibleHistoryIds(
         enable_thinking,
         reasoning_effort,
     );
+}
+fn chatVisibleHistoryIds(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    input_messages: []const chat_mod.Message,
+    visible_text: []const u8,
+    reasoning_text: ?[]const u8,
+    tool_calls: ?[]const chat_mod.ToolCall,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    reasoning_effort: ?[]const u8,
+) ![]u32 {
+    const history = try allocator.alloc(chat_mod.Message, input_messages.len + 1);
+    defer allocator.free(history);
+    @memcpy(history[0..input_messages.len], input_messages);
+    history[input_messages.len] = .{
+        .role = "assistant",
+        .content = visible_text,
+        .tool_calls = tool_calls,
+        .reasoning_content = reasoning_text,
+    };
+    return chat_mod.formatChatHistory(
+        allocator,
+        tok,
+        history,
+        chat_config,
+        tools_json,
+        tool_choice_instruction,
+        enable_thinking,
+        reasoning_effort,
+    );
+}
+
+fn bindChatToolFrontier(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    frontier_tag: ?u64,
+    frontier_tokens: u32,
+    cache_key: u64,
+    history_messages: []const chat_mod.Message,
+    visible_text: []const u8,
+    reasoning_text: ?[]const u8,
+    tool_calls: []const chat_mod.ToolCall,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    reasoning_effort: ?[]const u8,
+) void {
+    if (tool_calls.len == 0 or frontier_tag == null) return;
+    const visible_history = chatVisibleHistoryIds(
+        allocator,
+        tok,
+        chat_config,
+        history_messages,
+        visible_text,
+        reasoning_text,
+        tool_calls,
+        tools_json,
+        tool_choice_instruction,
+        enable_thinking,
+        reasoning_effort,
+    ) catch return;
+    defer allocator.free(visible_history);
+
+    const frontier = continuationFrontierFromExact(
+        lm,
+        frontier_tag,
+        frontier_tokens,
+        cache_key,
+        visible_history,
+    ) orelse return;
+
+    for (tool_calls) |call| {
+        if (continuation_mod.make(.tool_call_id, call.id)) |binding| {
+            continuationBind(io, allocator, binding, frontier);
+        }
+    }
+    log.info("[live-cont] bound Chat frontier={d} visible={d} tool_ids={d}\n", .{
+        frontier.token_len,
+        visible_history.len,
+        tool_calls.len,
+    });
+}
+fn assistantDeclaresToolCall(msg: chat_mod.Message, id: []const u8) bool {
+    if (!std.mem.eql(u8, msg.role, "assistant")) return false;
+    const calls = msg.tool_calls orelse return false;
+    for (calls) |call| if (std.mem.eql(u8, call.id, id)) return true;
+    return false;
+}
+
+fn sameContinuationFrontier(a: continuation_mod.FrontierRef, b: continuation_mod.FrontierRef) bool {
+    return a.model_tag == b.model_tag and a.entry_tag == b.entry_tag and a.token_len == b.token_len;
+}
+
+/// Resolve a stateless Chat Completions tool-result replay onto a server-owned
+/// exact frontier. The client tool id is only a proof key; the model prompt is
+/// reconstructed later as exact frontier tokens plus the proven new suffix.
+fn chatToolContinuation(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    messages: []const chat_mod.Message,
+    prompt_ids: []const u32,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+    reasoning_effort: ?[]const u8,
+    vision_key: u64,
+) ContinuationSubmit {
+    if (vision_key != 0 or messages.len < 2) return .{};
+
+    var last_tool_idx: ?usize = null;
+    var last_tool_id: ?[]const u8 = null;
+    var i = messages.len;
+    while (i > 0) {
+        i -= 1;
+        const msg = messages[i];
+        if (!std.mem.eql(u8, msg.role, "tool")) continue;
+        if (msg.tool_call_id) |id| if (id.len > 0) {
+            last_tool_idx = i;
+            last_tool_id = id;
+            break;
+        };
+    }
+    const tool_idx = last_tool_idx orelse return .{};
+    const tool_id = last_tool_id orelse return .{};
+
+    var assistant_idx: ?usize = null;
+    i = tool_idx;
+    while (i > 0) {
+        i -= 1;
+        if (assistantDeclaresToolCall(messages[i], tool_id)) {
+            assistant_idx = i;
+            break;
+        }
+    }
+    const aidx = assistant_idx orelse return .{};
+
+    const primary_binding = continuation_mod.make(.tool_call_id, tool_id) orelse return .{};
+    const frontier = continuationResolve(io, primary_binding) orelse return .{};
+
+    for (messages[aidx + 1 ..]) |msg| {
+        if (!std.mem.eql(u8, msg.role, "tool")) continue;
+        const id = msg.tool_call_id orelse return .{};
+        if (!assistantDeclaresToolCall(messages[aidx], id)) continue;
+        const binding = continuation_mod.make(.tool_call_id, id) orelse return .{};
+        const other = continuationResolve(io, binding) orelse return .{};
+        if (!sameContinuationFrontier(frontier, other)) return .{};
+    }
+
+    const hc = if (lm.prefix_cache) |*cache| cache else return .{};
+    if (frontier.model_tag != hc.cacheInstanceTag()) return .{};
+
+    const stable_messages = messages[0 .. aidx + 1];
+    const history_ids = chat_mod.formatChatHistory(
+        allocator,
+        tok,
+        stable_messages,
+        chat_config,
+        tools_json,
+        tool_choice_instruction,
+        enable_thinking,
+        reasoning_effort,
+    ) catch return .{};
+    defer allocator.free(history_ids);
+
+    if (!continuation_mod.visibleMatches(frontier, history_ids)) return .{};
+    if (!tokenPrefix(prompt_ids, history_ids)) return .{};
+    if (history_ids.len >= prompt_ids.len) return .{};
+
+    log.info("[live-cont] Chat tool continuation hit: frontier={d} visible={d} suffix={d}\n", .{
+        frontier.token_len,
+        history_ids.len,
+        prompt_ids.len - history_ids.len,
+    });
+    return .{
+        .model_tag = frontier.model_tag,
+        .frontier_tag = frontier.entry_tag,
+        .suffix = prompt_ids[history_ids.len..],
+    };
 }
 
 
@@ -8787,6 +8990,20 @@ fn handleChatCompletions(
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
+    const chat_continuation = chatToolContinuation(
+        stream.io,
+        allocator,
+        lm,
+        tok,
+        chat_config,
+        messages.items,
+        prompt_ids,
+        tools_json,
+        tool_choice_instruction,
+        enable_thinking,
+        if (effort_cfg) |e| e.effort else null,
+        vis_key,
+    );
 
     // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
     // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
@@ -8917,13 +9134,13 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, tool_choice_instruction, messages.items, if (effort_cfg) |e| e.effort else null, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, chat_continuation, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, tool_choice_instruction, messages.items, if (effort_cfg) |e| e.effort else null, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, vis_key, cache_key, chat_continuation, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9742,6 +9959,9 @@ fn handleNonStreamingGeneration(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    history_messages: []const chat_mod.Message,
+    reasoning_effort: ?[]const u8,
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
@@ -9755,6 +9975,7 @@ fn handleNonStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64,
+    continuation: ContinuationSubmit,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -9791,7 +10012,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, .{}, stream);
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, vision_key, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, continuation, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -9873,14 +10094,28 @@ fn handleNonStreamingGeneration(
                 result.prompt_tokens, result.completion_tokens, elapsed_ms, tc_perf, tool_calls.len,
             });
 
-            // Build tool_calls JSON array
+            // Build tool_calls JSON array and retain the exact ids we emit:
+            // those ids become protocol proofs for the next tool-result turn.
+            var emitted_tool_calls = std.ArrayList(chat_mod.ToolCall).empty;
+            defer {
+                for (emitted_tool_calls.items) |call| allocator.free(call.id);
+                emitted_tool_calls.deinit(allocator);
+            }
             var tc_buf = std.ArrayList(u8).empty;
             defer tc_buf.deinit(allocator);
             try tc_buf.appendSlice(allocator, "[");
+            const call_stamp = nowMs(stream.io);
             for (tool_calls, 0..) |tc, i| {
                 if (i > 0) try tc_buf.appendSlice(allocator, ",");
-                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ nowMs(stream.io), i });
-                defer allocator.free(tc_id);
+                const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ call_stamp, i });
+                emitted_tool_calls.append(allocator, .{
+                    .id = tc_id,
+                    .name = tc.name,
+                    .arguments = tc.arguments,
+                }) catch |err| {
+                    allocator.free(tc_id);
+                    return err;
+                };
                 const escaped_name = try jsonEscape(allocator, tc.name);
                 defer allocator.free(escaped_name);
                 const escaped_args = try jsonEscape(allocator, tc.arguments);
@@ -9913,6 +10148,25 @@ fn handleNonStreamingGeneration(
             const tc_content_esc = jsonEscapeOrEmpty(allocator, tc_preamble);
             defer if (tc_content_esc.owned) allocator.free(tc_content_esc.slice);
             const tc_content_json: []const u8 = if (tc_preamble.len > 0) tc_content_esc.slice else "null";
+
+            bindChatToolFrontier(
+                stream.io,
+                allocator,
+                lm,
+                tok,
+                lm.chat_config.?,
+                result.continuation_frontier_tag,
+                result.continuation_frontier_tokens,
+                cache_key,
+                history_messages,
+                tc_preamble,
+                tc_think_split.reasoning_content,
+                emitted_tool_calls.items,
+                tools_json,
+                tool_choice_instruction,
+                enable_thinking,
+                reasoning_effort,
+            );
 
             const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
@@ -10430,6 +10684,9 @@ fn handleStreamingGeneration(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    history_messages: []const chat_mod.Message,
+    reasoning_effort: ?[]const u8,
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
@@ -10443,6 +10700,7 @@ fn handleStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     vision_key: u64,
     cache_key: u64,
+    continuation: ContinuationSubmit,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -10523,6 +10781,9 @@ fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .vision_key = vision_key,
         .cache_key = cache_key,
+        .continuation_model_tag = continuation.model_tag,
+        .continuation_frontier_tag = continuation.frontier_tag,
+        .continuation_suffix = continuation.suffix,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -11193,11 +11454,17 @@ fn handleStreamingGeneration(
                 }
                 allocator.free(tool_calls);
             }
+            var emitted_tool_calls = std.ArrayList(chat_mod.ToolCall).empty;
+            defer {
+                for (emitted_tool_calls.items) |call| allocator.free(call.id);
+                emitted_tool_calls.deinit(allocator);
+            }
+            const history_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
 
             // Emit reasoning_content before tool calls — whatever the model
             // generated is delivered, thinking flag or not.
             {
-                const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
+                const think_split = history_split;
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -11222,7 +11489,14 @@ fn handleStreamingGeneration(
             // Emit tool call deltas in OpenAI streaming format
             for (tool_calls, 0..) |tc, i| {
                 const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
-                defer allocator.free(tc_id);
+                emitted_tool_calls.append(allocator, .{
+                    .id = tc_id,
+                    .name = tc.name,
+                    .arguments = tc.arguments,
+                }) catch |err| {
+                    allocator.free(tc_id);
+                    return err;
+                };
 
                 // Escape the full arguments string for embedding in JSON
                 const escaped_args = try jsonEscape(allocator, tc.arguments);
@@ -11240,6 +11514,24 @@ fn handleStreamingGeneration(
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = try lps.take() });
             }
+            bindChatToolFrontier(
+                stream.io,
+                allocator,
+                lm,
+                tok,
+                lm.chat_config.?,
+                ts.continuation_frontier_tag,
+                ts.continuation_frontier_tokens,
+                cache_key,
+                history_messages,
+                visibleToolPreamble(history_split.content),
+                history_split.reasoning_content,
+                emitted_tool_calls.items,
+                tools_json,
+                tool_choice_instruction,
+                enable_thinking,
+                reasoning_effort,
+            );
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
             // No tool calls found — flush buffered tokens, splitting thinking
