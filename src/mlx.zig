@@ -113,6 +113,18 @@ pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_
 /// Wraps `data` in place when the backend can (Metal no-copy `newBuffer(ptr, len)`), else
 /// COPIES it and calls `dtor(payload)` at once. `dtor` also runs when the last reference drops.
 pub extern "c" fn mlx_array_new_data_managed_payload(data: *anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: *const fn (?*anyopaque) callconv(.c) void) mlx_array;
+
+// mlx-serve-owned no-copy mmap bridge (src/mlx_mmap_shim.cpp). One shard is
+// one MAP_PRIVATE file mapping + one Metal no-copy buffer; tensor arrays share
+// that buffer and differ only by byte offset.
+pub const msv_mmap_shard = opaque {};
+pub extern "c" fn msv_mmap_shard_open(out: **msv_mmap_shard, path: [*:0]const u8) c_int;
+pub extern "c" fn msv_mmap_shard_close(shard: *msv_mmap_shard) void;
+pub extern "c" fn msv_mmap_shard_size(shard: *const msv_mmap_shard) usize;
+pub extern "c" fn msv_mmap_shard_array(out: *mlx_array, shard: *msv_mmap_shard, byte_offset: usize, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) c_int;
+pub extern "c" fn msv_mmap_shard_dontneed(shard: *msv_mmap_shard, byte_offset: usize, byte_length: usize) c_int;
+pub extern "c" fn msv_mmap_last_error() [*:0]const u8;
+
 pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
 

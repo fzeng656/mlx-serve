@@ -158,6 +158,8 @@ fn printUsage(io: std.Io) void {
         \\                        room (default: an eighth of RAM, 2 to 8 GB). 0 turns
         \\                        it off: more context and concurrency, but a small Mac
         \\                        under heavy load can freeze or restart.
+        \\  --mmap-routed-experts  Qwen4 only: keep routed MoE experts file-backed
+        \\                        with read-only mmap. Off by default.
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -690,6 +692,8 @@ pub fn main(init: std.process.Init) !void {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
+        } else if (std.mem.eql(u8, args[i], "--mmap-routed-experts")) {
+            model_mod.mmap_routed_experts_policy = true;
         } else if (std.mem.eql(u8, args[i], "--no-safety")) {
             // Retired image content filter; accepted as a no-op.
         } else if (std.mem.eql(u8, args[i], "--pld")) {

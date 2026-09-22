@@ -3568,6 +3568,20 @@ pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     return weights_bytes + headroom;
 }
 
+pub fn mmapPreflightWeightBytes(total_bytes: u64, mmap_bytes: u64) u64 {
+    if (total_bytes == 0 or mmap_bytes == 0) return total_bytes;
+    const mapped = @min(total_bytes, mmap_bytes);
+    const active_mmap_working_set: u64 = 2 * 1024 * 1024 * 1024;
+    return total_bytes - mapped + @min(mapped, active_mmap_working_set);
+}
+
+test "mmap preflight bills resident weights plus bounded expert working set" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(8 * GB, mmapPreflightWeightBytes(70 * GB, 64 * GB));
+    try std.testing.expectEqual(10 * GB, mmapPreflightWeightBytes(10 * GB, 0));
+    try std.testing.expectEqual(2 * GB, mmapPreflightWeightBytes(4 * GB, 4 * GB));
+}
+
 test "a refusal quotes the number it actually compared" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -3604,7 +3618,7 @@ test "BOTH preflight refusals quote the number they compared, not the weights" {
     // helper the comparison itself uses — never a second formula that can drift.
     const media_arg = "loadRequirement" ++ "Bytes(peak))) / gb";
     try testing.expect(std.mem.indexOf(u8, src, media_arg) != null);
-    const text_arg = "loadRequirement" ++ "Bytes(weights_bytes))) / gb";
+    const text_arg = "loadRequirement" ++ "Bytes(ram_weight_bytes))) / gb";
     try testing.expect(std.mem.indexOf(u8, src, text_arg) != null);
     // The weights-first shape that could not state its own bar must be GONE.
     const old = "Insufficient memory to load model: weights ~" ++ "{d:.1} GB but only";
@@ -3780,6 +3794,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         return;
     }
 
+    const mmap_experts_this_load = model_mod.mmapRoutedExpertsPolicyEnabled() and params.config.isQwen4();
+    model_mod.mmap_routed_experts_on_load = mmap_experts_this_load;
+    defer model_mod.mmap_routed_experts_on_load = false;
+
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
     // so it terminates the whole process. Refuse the load up front instead, with
@@ -3801,37 +3819,54 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (!skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
         const model_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const mmap_bytes = if (mmap_experts_this_load)
+            model_mod.estimateMmapRoutedExpertBytes(sch.io, sch.allocator, params.model_dir)
+        else
+            0;
+        const ram_model_bytes = mmapPreflightWeightBytes(model_bytes, mmap_bytes);
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
-        const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
+        const ram_weights_bytes = ram_model_bytes + mtp_bytes;
+        const total_ram_bytes = ram_weights_bytes + drafter_bytes;
         const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), mlx.maxRecommendedWorkingSet());
-        log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
-            @as(f64, @floatFromInt(model_bytes)) / gb,
-            @as(f64, @floatFromInt(avail_bytes)) / gb,
-        });
+
+        if (mmap_bytes > 0) {
+            log.info("[preflight] model ~{d:.2} GB ({d:.2} GB mmap experts; RAM-facing model estimate {d:.2} GB), available {d:.2} GB\n", .{
+                @as(f64, @floatFromInt(model_bytes)) / gb,
+                @as(f64, @floatFromInt(mmap_bytes)) / gb,
+                @as(f64, @floatFromInt(ram_model_bytes)) / gb,
+                @as(f64, @floatFromInt(avail_bytes)) / gb,
+            });
+        } else {
+            log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
+                @as(f64, @floatFromInt(model_bytes)) / gb,
+                @as(f64, @floatFromInt(avail_bytes)) / gb,
+            });
+        }
         if (drafter_bytes > 0) log.info("[preflight] drafter ~{d:.2} GB at {s}\n", .{ @as(f64, @floatFromInt(drafter_bytes)) / gb, sidecar });
         if (mtp_bytes > 0) log.info("[preflight] mtp sidecar ~{d:.2} GB\n", .{@as(f64, @floatFromInt(mtp_bytes)) / gb});
-        switch (preflightVerdict(model_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
+
+        switch (preflightVerdict(ram_weights_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
             .fits => {},
             .drop_drafter => {
                 log.warn("[dflash] sidecar at {s} skipped: model + drafter need ~{d:.1} GB free, {d:.1} GB available; the model loads without it\n", .{
                     sidecar,
-                    @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
+                    @as(f64, @floatFromInt(loadRequirementBytes(total_ram_bytes))) / gb,
                     @as(f64, @floatFromInt(avail_bytes)) / gb,
                 });
                 sch.allocator.free(in_dir_drafter.?);
                 in_dir_drafter = null;
             },
             .refuse => {
-                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
-                    @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
-                    @as(f64, @floatFromInt(weights_bytes)) / gb,
-                    if (drafter_bytes > 0) " and drafter" else "",
+                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB RAM-facing weights plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                    @as(f64, @floatFromInt(loadRequirementBytes(total_ram_bytes))) / gb,
+                    @as(f64, @floatFromInt(total_ram_bytes)) / gb,
                     @as(f64, @floatFromInt(avail_bytes)) / gb,
                 });
                 return error.InsufficientMemory;
             },
+        }
         }
     }
 
