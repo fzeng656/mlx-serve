@@ -5149,6 +5149,20 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
+var decode_frontier_checkpoint_cached: ?bool = null;
+
+/// Opt-in first while the live A/B measures memory and hit quality. A frontier
+/// checkpoint is correctness-safe (lookup still requires an exact token
+/// prefix), but one extra recurrent snapshot per active entry is a real memory
+/// cost and should earn its residency before becoming the default.
+pub fn decodeFrontierCheckpointEnabled() bool {
+    if (decode_frontier_checkpoint_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_DECODE_FRONTIER_CP");
+    const on = raw != null and !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    decode_frontier_checkpoint_cached = on;
+    return on;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -5177,21 +5191,87 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     const n_gen = gen_ptr.generated_ids.items.len;
     if (commitDeclinesPadOnly(n_gen, slot.was_pad_only)) return;
 
-    // Construct the full token sequence: the original prompt + everything
-    // generated this turn. The cache reflects exactly this state — Generator
-    // forwarded each emitted token into slot.cache as it was sampled.
-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    // Construct the exact token sequence represented by the live state:
+    // prompt + visible generated tokens, plus a forwarded EOS/turn terminator.
+    // The terminator is cache identity only; API completion content/usage is
+    // unchanged, and exact-token lookup decides whether the next turn renders
+    // the same boundary token.
+    const terminal_len: usize = if (gen_ptr.frontier_terminal_id != null) 1 else 0;
+    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len + terminal_len;
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
+    const gen_end = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    @memcpy(total_tokens[slot.full_prompt.len..gen_end], gen_ptr.generated_ids.items);
+    if (gen_ptr.frontier_terminal_id) |terminal| total_tokens[gen_end] = terminal;
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-
     // attn models this returns an empty slice (no allocator hit). Ownership
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
-    const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    var ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+
+    // Experimental agent-continuation frontier. Prefill checkpoints stop near
+    // the REQUEST prompt end, but an agent turn can decode thousands of tokens
+    // before the cache entry is committed. The entry already stores
+    // prompt+generated tokens and KV through that final position; hybrid
+    // recurrent state needs the same frontier checkpoint or the next
+    // append-only turn must replay the whole previous answer.
+    //
+    // Safety contract: only stamp total_len when the hybrid sequence frontier
+    // (moe_seq_offset; GDN keeps KVCache.step at 0) is exactly there. Any
+    // speculative/pipeline skew declines
+    // this optimization and leaves the upstream checkpoint path untouched.
+    // Text-only first: media history has an independent pixel-key boundary and
+    // is deliberately left on the existing path for the initial A/B.
+    if (decodeFrontierCheckpointEnabled() and
+        n_gen > 0 and
+        slot.vision_key == 0 and
+        slot.ssm_entries != null and
+        slot.moe_seq_offset == total_len)
+    frontier_cp: {
+        const cp_alloc = gen_ptr.ssm_checkpoint_alloc orelse break :frontier_cp;
+        const xfm = slot.model.transformer orelse break :frontier_cp;
+        // Allocate the enlarged owner slice first. This preserves the upstream
+        // one-owner rule in commitSlotIfApplicable: after capture succeeds the
+        // checkpoint always moves directly into a slice that will transfer to
+        // HotPrefixCache; no caller-side checkpoint deinit exists on an error
+        // path.
+        const grown = cp_alloc.alloc(transformer_mod.SSMCheckpoint, ssm_cps_slice.len + 1) catch |err| {
+            log.warn("[hot-cache] decode frontier checkpoint allocation failed: {s}\n", .{@errorName(err)});
+            break :frontier_cp;
+        };
+        const cp = transformer_mod.captureSsmCheckpoint(
+            cp_alloc,
+            slot.ssm_entries.?,
+            total_len,
+            xfm.s,
+        ) catch |err| {
+            cp_alloc.free(grown);
+            log.warn("[hot-cache] decode frontier checkpoint capture failed at {d}: {s}\n", .{ total_len, @errorName(err) });
+            break :frontier_cp;
+        };
+        @memcpy(grown[0..ssm_cps_slice.len], ssm_cps_slice);
+        grown[ssm_cps_slice.len] = cp;
+        cp_alloc.free(ssm_cps_slice);
+        ssm_cps_slice = grown;
+        log.info("[hot-cache] decode frontier checkpoint @{d} (prompt={d}, generated={d}, terminal={s})\n", .{
+            total_len,
+            slot.full_prompt.len,
+            n_gen,
+            if (gen_ptr.frontier_terminal_id != null) "yes" else "no",
+        });
+    } else if (decodeFrontierCheckpointEnabled() and n_gen > 0 and slot.ssm_entries != null) {
+        log.debug("[hot-cache] decode frontier skipped (prompt={d}, generated={d}, moe_seq_offset={d}, total={d}, vision={x})\n", .{
+            slot.full_prompt.len,
+            n_gen,
+            slot.moe_seq_offset,
+            total_len,
+            slot.vision_key,
+        });
+    }
+
     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
@@ -6535,6 +6615,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            .decode_frontier_checkpoint = decodeFrontierCheckpointEnabled(),
             // A restored prefix already holds its image rows: the splice
             // resumes at the placeholder count inside the matched prefix.
             .vision_rows_before = if (slot.vision_embeddings != null and hot_matched > 0)
@@ -7236,6 +7317,28 @@ test "DFlash cache payload is committed only when it spans the trunk prefix" {
     const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
     const body = source[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
+}
+
+test "hybrid decode frontier is captured only at an exact committed token position" {
+    const source = @embedFile("scheduler.zig");
+    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn finishSlot(") orelse return error.MissingFinishSlot;
+    const body = source[start..end];
+
+    // The feature is opt-in for the first production A/B.
+    try testing.expect(std.mem.indexOf(u8, body, "decodeFrontierCheckpointEnabled()") != null);
+    // GDN trunks keep KVCache.step at zero; moe_seq_offset is the recurrent/token frontier.
+    try testing.expect(std.mem.indexOf(u8, body, "slot.moe_seq_offset == total_len") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "slot.cache.step == total_len") == null);
+    // The frontier must describe the exact committed token identity. Natural
+    // EOS is forwarded but hidden from API content, so it rides the cache key
+    // as one terminal token and advances total_len by one.
+    try testing.expect(std.mem.indexOf(u8, body, "captureSsmCheckpoint(") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "frontier_terminal_id") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "terminal_len") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "total_len,") != null);
+    // Initial scope excludes media so pixel-key history cannot be conflated with text continuation.
+    try testing.expect(std.mem.indexOf(u8, body, "slot.vision_key == 0") != null);
 }
 
 test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
