@@ -111,7 +111,7 @@ struct BenchmarkSessionSheet: View {
             }
             .font(.callout)
             .foregroundStyle(.secondary)
-            BenchmarkSettingsChips(settings: settings, isLossy: isLossy)
+            BenchmarkSettingsChips(settings: settings)
             if case .session(let s) = source, let note = s.note {
                 Text(note).font(.callout).foregroundStyle(.secondary)
             }
@@ -171,9 +171,6 @@ struct BenchmarkSessionSheet: View {
     }
     private var settings: [String: String] {
         switch source { case .session(let s): return s.settings; case .family(let f): return f.settings }
-    }
-    private var isLossy: Bool {
-        switch source { case .session(let s): return s.isLossy; case .family(let f): return f.isLossy }
     }
     private var engineVersion: String {
         switch source {

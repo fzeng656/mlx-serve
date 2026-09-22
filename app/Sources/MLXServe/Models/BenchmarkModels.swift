@@ -122,6 +122,9 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
     /// machine hold its speed? Same values on every row of a session.
     var driftDecodeTps: Double?
     var driftPercent: Double?
+    /// Random per-install id (`InstallId`), stamped at Share time.
+    /// Absent on rows shared by older apps.
+    var installId: String?
 
     static let maxNoteLength = 120
 
@@ -231,6 +234,7 @@ struct BenchmarkResult: Codable, Identifiable, Hashable {
         note = try c.decodeIfPresent(String.self, forKey: .note)
         driftDecodeTps = try c.decodeIfPresent(Double.self, forKey: .driftDecodeTps)
         driftPercent = try c.decodeIfPresent(Double.self, forKey: .driftPercent)
+        installId = try c.decodeIfPresent(String.self, forKey: .installId)
         isLossy = try c.decodeIfPresent(Bool.self, forKey: .isLossy) ?? BenchmarkSettings.isLossy(settings ?? [:])
     }
 
@@ -420,10 +424,16 @@ enum BenchmarkSettings {
     /// Short chips for a table row: "KV 8-bit", "PLD", "MTP off", "ctx 48K".
     static func summaryChips(_ s: [String: String]) -> [String] {
         var chips: [String] = []
-        if let kv = s["kv_quant"] { chips.append(kv == "off" ? "KV off" : "KV \(kv)-bit") }
+        // ds4 has no KV lever and llama.cpp no MTP; `/props` reports them off.
+        let engine = s["engine"] ?? "mlx"
+        if engine == "ds4" { chips.append("ds4") }
+        if engine == "llama" { chips.append("llama.cpp") }
+        if engine != "ds4", let kv = s["kv_quant"] {
+            chips.append(kv == "off" ? "KV off" : Int(kv) != nil ? "KV \(kv)-bit" : "KV \(kv)")
+        }
         if s["decode_attn_quant"] == "true" { chips.append("Attn quant") }
         if s["pld_default_on"] == "true" { chips.append("PLD") }
-        if let mtp = s["mtp_default_on"] { chips.append(mtp == "true" ? "MTP" : "MTP off") }
+        if engine != "llama", let mtp = s["mtp_default_on"] { chips.append(mtp == "true" ? "MTP" : "MTP off") }
         if let drafter = s["drafter"], drafter != "none" {
             chips.append(drafter == "dflash" ? "DFlash" : "Drafter")
         }

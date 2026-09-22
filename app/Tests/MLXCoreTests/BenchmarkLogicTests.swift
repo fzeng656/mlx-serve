@@ -192,6 +192,14 @@ final class BenchmarkLogicTests: XCTestCase {
         XCTAssertEqual(BenchmarkSettings.summaryChips([:]), [])
     }
 
+    func testSummaryChipsNameTheEmbeddedEngineAndDropItsNonLevers() {
+        XCTAssertEqual(BenchmarkSettings.summaryChips(["engine": "ds4", "kv_quant": "off", "decode_attn_quant": "false",
+                                                       "mtp_default_on": "true", "drafter": "none", "n_ctx": "131072"]),
+                       ["ds4", "MTP", "ctx 128K"])
+        XCTAssertEqual(BenchmarkSettings.summaryChips(["engine": "llama", "kv_quant": "q8", "mtp_default_on": "false", "n_ctx": "8192"]),
+                       ["llama.cpp", "KV q8", "ctx 8K"])
+    }
+
     // MARK: - Sessions
 
     func testSessionsGroupBySessionIdAndSortRungsAscending() {

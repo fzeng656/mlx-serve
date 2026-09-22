@@ -480,7 +480,7 @@ class APIClient {
         // on a 235B is not fast either.
         request.timeoutInterval = timeout
 
-        var body: [String: Any] = [
+        let body: [String: Any] = [
             "model": model,
             "messages": [["role": "user", "content": prompt]],
             "max_tokens": maxTokens,

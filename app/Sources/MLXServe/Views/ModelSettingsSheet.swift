@@ -52,12 +52,18 @@ struct ModelSettingsSheet: View {
         return appState.localModels.first { $0.path == request.path }?.hasMtpHead
     }
 
+    /// ds4 and llama.cpp read only the context size from model-settings.json.
+    private var isGguf: Bool {
+        request.path.hasSuffix(".gguf") || appState.localModels.first { $0.path == request.path }?.quantFile != nil
+    }
+
     private var rows: (mtp: Bool, acceptance: Bool) {
-        ModelSettingsApply.mtpRows(available: mtpAvailable, mtp: override.mtp)
+        if isGguf { return (false, false) }
+        return ModelSettingsApply.mtpRows(available: mtpAvailable, mtp: override.mtp)
     }
 
     private var formHeight: CGFloat {
-        var n = 2
+        var n = isGguf ? 1 : 2
         if rows.mtp { n += 1 }
         if rows.acceptance { n += 1 }
         if live?.loaded == true { n += 1 }
@@ -92,11 +98,13 @@ struct ModelSettingsSheet: View {
                         Text(ContextSizeDisplay.formatTokens(n)).tag(n)
                     }
                 }
+                if !isGguf {
                 Picker("KV cache", selection: Binding(
                     get: { override.kvQuant?.rawValue ?? "" },
                     set: { override.kvQuant = KvQuantChoice(rawValue: $0) })) {
                     Text("Default").tag("")
                     ForEach(KvQuantChoice.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
+                }
                 }
                 if rows.mtp {
                 Picker("MTP", selection: Binding(
@@ -117,7 +125,8 @@ struct ModelSettingsSheet: View {
                 }
                 if let live, live.loaded {
                     LabeledContent("Live") {
-                        Text("\(ContextSizeDisplay.formatTokens(live.contextLength)) context, KV \(live.kvQuant.isEmpty ? "default" : live.kvQuant)")
+                        Text(isGguf ? "\(ContextSizeDisplay.formatTokens(live.contextLength)) context"
+                             : "\(ContextSizeDisplay.formatTokens(live.contextLength)) context, KV \(live.kvQuant.isEmpty ? "default" : live.kvQuant)")
                             .foregroundStyle(.secondary)
                     }
                 }

@@ -11,9 +11,7 @@ import SwiftUI
 /// values are read from `/props` and recorded on every row so the board can
 /// show how a number was achieved.
 ///
-/// The benchmark measures whatever chat model the server has loaded. Picking
-/// a model here would mean re-implementing load/unload orchestration for a
-/// window whose job is measurement, and the tray already owns that.
+/// Picking a model loads it, so the settings card reads what a run will measure.
 struct BenchmarkView: View {
 
     @EnvironmentObject private var appState: AppState
@@ -40,6 +38,8 @@ struct BenchmarkView: View {
     @AppStorage("benchmarkNote") private var note = ""
     /// The model to benchmark, by path. Empty = follow the tray's selection.
     @State private var pickedModelPath = ""
+    @State private var loadingModel = false
+    @State private var modelSettings: ModelSettingsRequest?
     @State private var confirmingClear = false
 
     /// Community filters. Machine defaults to THIS Mac once the board has a
@@ -112,6 +112,16 @@ struct BenchmarkView: View {
         // model name, and a task keyed on the name alone never re-fired, so
         // the card sat on "Reading settings…" against a running server.
         .task(id: settingsRefreshKey) { await refreshSettings() }
+        // Load on pick so the settings card shows what a run will measure.
+        .onChange(of: pickedModelPath) { old, new in
+            guard !old.isEmpty, !new.isEmpty, !isRunning else { return }
+            Task { await loadPick() }
+        }
+        .sheet(item: $modelSettings, onDismiss: { Task { await refreshSettings() } }) {
+            ModelSettingsSheet(request: $0)
+                .environmentObject(appState)
+                .environmentObject(server)
+        }
         .sheet(item: $sheetSource) { item in
             BenchmarkSessionSheet(source: item.source)
                 .environmentObject(appState)
@@ -207,17 +217,21 @@ struct BenchmarkView: View {
     private var setupCard: some View {
         BenchCard("Setup", icon: "gearshape") {
             VStack(spacing: 0) {
-                BenchRow("Model", detail: pickedIsResident ? nil : "Loaded when the run starts.") {
+                BenchRow("Model", detail: pickedIsResident || loadingModel ? nil : "Loaded when the run starts.") {
                     if pickableModels.isEmpty {
                         Text("No chat model on this Mac").foregroundStyle(.secondary)
                     } else {
-                        Picker("Model", selection: $pickedModelPath) {
-                            ForEach(pickableModels) { model in
-                                Text(model.name).tag(model.path)
+                        HStack(spacing: 6) {
+                            if loadingModel { ProgressView().controlSize(.small) }
+                            Picker("Model", selection: $pickedModelPath) {
+                                ForEach(pickableModels) { model in
+                                    Text(model.name).tag(model.path)
+                                }
                             }
+                            .labelsHidden()
+                            .frame(maxWidth: 220)
+                            .disabled(loadingModel || isRunning)
                         }
-                        .labelsHidden()
-                        .frame(maxWidth: 220)
                     }
                 }
                 Divider().padding(.vertical, 9)
@@ -248,19 +262,25 @@ struct BenchmarkView: View {
                 if liveSettings.isEmpty {
                     // Settings are per MODEL: a running server with nothing
                     // resident publishes none, so "reading" would never end.
-                    Text(server.status != .running ? "Server not running"
+                    Text(loadingModel ? "Loading model…"
+                         : server.status != .running ? "Server not running"
                          : server.residentChatModel == nil ? "No model loaded — settings are read from the loaded model."
                          : "Reading settings…")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    BenchmarkSettingsChips(settings: liveSettings,
-                                           isLossy: BenchmarkSettings.isLossy(liveSettings))
+                    BenchmarkSettingsChips(settings: liveSettings)
                 }
                 HStack {
                     Button("Change in Settings…") { appState.showSettings() }
                         .controlSize(.small)
+                    Button("Model Settings…") {
+                        guard let pick = pickedModel else { return }
+                        modelSettings = ModelSettingsRequest(path: pick.path, title: ModelDisplayName.pretty(pick.displayLabel))
+                    }
+                    .controlSize(.small)
+                    .disabled(pickedModel == nil || loadingModel || isRunning)
                     Button {
                         Task { await refreshSettings() }
                     } label: {
@@ -332,7 +352,7 @@ struct BenchmarkView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .disabled(isRunning || pickedModel == nil || contextTooSmall)
+            .disabled(isRunning || loadingModel || pickedModel == nil || contextTooSmall)
 
             if pickedModel == nil {
                 Text("Download a chat model from the menu bar to run a benchmark.")
@@ -441,7 +461,7 @@ struct BenchmarkView: View {
                         .width(min: 140, ideal: 220)
 
                         TableColumn("Settings") { session in
-                            BenchmarkSettingsChips(settings: session.settings, isLossy: session.isLossy)
+                            BenchmarkSettingsChips(settings: session.settings)
                         }
                         .width(min: 160, ideal: 220)
 
@@ -575,7 +595,7 @@ struct BenchmarkView: View {
                     .width(min: 140, ideal: 200)
 
                     TableColumn("Settings") { family in
-                        BenchmarkSettingsChips(settings: family.settings, isLossy: family.isLossy)
+                        BenchmarkSettingsChips(settings: family.settings)
                     }
                     .width(min: 160, ideal: 220)
 
@@ -679,10 +699,23 @@ struct BenchmarkView: View {
         if server.status != .running || appState.selectedModelPath != pick.path {
             guard await appState.useModelAndAwaitReady(atPath: pick.path) else { return nil }
         }
+        // Ready means /health answered, not that the model list caught up; and a
+        // `--model` launch skips `ensureDefaultChatModel`, so load it directly.
+        await server.refreshModels()
         if server.residentChatModel == nil {
-            await server.ensureDefaultChatModel(selectedModelPath: pick.path)
+            _ = try? await server.loadModel(id: pick.path)
         }
         return server.residentChatModel
+    }
+
+    private func loadPick() async {
+        loadingModel = true
+        runError = nil
+        defer { loadingModel = false }
+        if await loadPickedModel() == nil {
+            runError = "The model could not be loaded. Check the server log."
+        }
+        await refreshSettings()
     }
 
     private func runBenchmark() async {

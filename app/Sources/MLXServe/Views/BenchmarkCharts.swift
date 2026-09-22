@@ -184,7 +184,6 @@ enum BenchmarkFormat {
 /// Settings chips, as the tables draw them.
 struct BenchmarkSettingsChips: View {
     let settings: [String: String]
-    var isLossy: Bool
 
     var body: some View {
         HStack(spacing: 4) {
@@ -195,22 +194,7 @@ struct BenchmarkSettingsChips: View {
                     .padding(.vertical, 2)
                     .background(.quaternary.opacity(0.5), in: Capsule())
             }
-            if isLossy { LossyBadge() }
         }
-    }
-}
-
-/// `--kv-quant` and `--decode-attn-quant` trade output quality for speed, so a
-/// speed-ranked board that didn't say so would be recommending worse answers.
-struct LossyBadge: View {
-    var body: some View {
-        Text("LOSSY")
-            .font(.system(size: 9, weight: .bold))
-            .tracking(0.4)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(.orange.opacity(0.18), in: Capsule())
-            .foregroundStyle(.orange)
     }
 }
 

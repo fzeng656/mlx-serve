@@ -213,7 +213,7 @@ struct StatusMenuView: View {
     /// App name + version, the single status chip, and Settings.
     private var header: some View {
         HStack(spacing: 8) {
-            Text("MLX Core")
+            Text("MLX-Serve")
                 .font(.headline)
             Text(L10n.text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
                 .font(.caption)
@@ -498,8 +498,8 @@ struct StatusMenuView: View {
     @ViewBuilder private func throughputRows(_ t: ThroughputSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
-            statRow("Decode", "\(ThroughputSnapshot.formatTPS(server.decodeTPSNow)) now · \(ThroughputSnapshot.formatTPS(t.avgDecodeTPS)) avg tok/s")
-            statRow("Prefill", "\(ThroughputSnapshot.formatTPS(server.prefillTPSNow)) now · \(ThroughputSnapshot.formatTPS(t.avgPrefillTPS)) avg tok/s")
+            statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.decodeTPSNow), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
+            statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.prefillTPSNow), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
         }
     }
 
@@ -628,7 +628,7 @@ struct StatusMenuView: View {
                 // Named and red: the bare power glyph read as "stop the
                 // server", which is the control directly above it.
                 TrayTile(icon: "power", title: "Quit",
-                         help: "Quit MLX Core — stops the server and closes the app",
+                         help: "Quit MLX-Serve — stops the server and closes the app",
                          tint: .red) {
                     server.stop()
                     NSApplication.shared.terminate(nil)
@@ -798,7 +798,7 @@ struct UpdateTrayRow: View {
                     Image(systemName: "sparkles")
                         .foregroundStyle(.blue)
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("MLX Core v\(update.version) is available")
+                        Text("MLX-Serve v\(update.version) is available")
                             .font(.subheadline.weight(.medium))
                         if case .failed(let message) = updates.phase {
                             Text(message)

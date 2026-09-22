@@ -529,7 +529,7 @@ class ServerManager: ObservableObject {
         source.setEventHandler { [weak self] in
             guard let self else { source.cancel(); return }
             let url = healthURL
-            URLSession.shared.dataTask(with: url) { data, response, error in
+            URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
                 guard let http = response as? HTTPURLResponse, http.statusCode == 200,
                       let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       json["status"] as? String == "ok" else { return }
@@ -829,12 +829,21 @@ class ServerManager: ObservableObject {
         for pid in pids where pid != myPid {
             guard processName(pid: pid).hasPrefix("mlx-serve") else { continue }
             kill(pid, SIGTERM)
-            for _ in 0..<20 {
-                if kill(pid, 0) != 0 { break } // process gone
-                Thread.sleep(forTimeInterval: 0.1)
+            if !waitForExit(pid) {
+                // A large resident model can take seconds to tear down after SIGKILL too;
+                // launching before it is gone fails the new server's port check.
+                kill(pid, SIGKILL)
+                _ = waitForExit(pid)
             }
-            if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
         }
+    }
+
+    private func waitForExit(_ pid: pid_t, seconds: Double = 2) -> Bool {
+        for _ in 0..<Int(seconds * 10) {
+            if kill(pid, 0) != 0 { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return kill(pid, 0) != 0
     }
 
     /// Was `/usr/sbin/lsof -nP -iTCP:<port> -sTCP:LISTEN -t`; now libproc, which

@@ -107,9 +107,9 @@ final class AgentModelListTests: XCTestCase {
         // provider-composer's applyExtension spreads ONLY the definition —
         // provider-level compat from models.json is NOT stamped onto
         // extension-registered models. Without per-model compat pi would use
-        // max_completion_tokens + the wrong thinking format.
+        // max_completion_tokens, and without the level map "off" would send nothing.
         let js = AgentConfigs.piModelsExtensionJS(baseURL: "http://h:1")
-        for needle in ["maxTokensField", "max_tokens", "thinkingFormat", "qwen",
+        for needle in ["maxTokensField", "max_tokens", "thinkingLevelMap",
                        "supportsDeveloperRole", "supportsReasoningEffort"] {
             XCTAssertTrue(js.contains(needle), "compat field \(needle) missing: \(js)")
         }

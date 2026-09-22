@@ -193,7 +193,7 @@ if [ -f "$BENCH" ]; then
   check "$BENCH" 'id="mode-prefill"'       "benchmarks: prefill view toggle"
   check "$BENCH" 'id="f-chip"'             "benchmarks: chip filter"
   check "$BENCH" 'id="f-ram"'              "benchmarks: memory filter"
-  check "$BENCH" 'lossy'                   "benchmarks: lossy-setting badge"
+  check "$BENCH" 'value="lossless"'        "benchmarks: lossless filter"
   # The grouping mirrors BenchmarkStore.familyKey in the Swift app; both sides
   # are unit-tested so the two can't quote different numbers for one dataset.
   if command -v node >/dev/null 2>&1; then

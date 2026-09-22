@@ -72,7 +72,7 @@ final class LocalizationTests: XCTestCase {
         let withoutCJK = entries.filter { entry in
             !entry.value.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
         }
-        // Model-variant labels ("Gemma 4 E2B (4-bit)"), "Agent" and "API key" stay
+        // Model-variant labels ("Gemma 4 E2B (4-bit)") and "API key" stay
         // Latin by design; anything else without Chinese is a leftover.
         XCTAssertLessThanOrEqual(withoutCJK.count, 25,
                                  "untranslated: \(withoutCJK.map(\.key).prefix(12))")

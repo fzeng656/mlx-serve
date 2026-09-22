@@ -5600,6 +5600,7 @@ fn pcQsaFeed(xfm: *transformer_mod.Transformer, entry: *SSMCacheEntry, keys: mlx
 
 fn pcQsaSweep(hc: *HotPrefixCache, toks: []const u32, keys: mlx.mlx_array, lo: usize, hi: usize, s: mlx.mlx_stream) !void {
     var xfm: transformer_mod.Transformer = undefined;
+    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     var r = lo;
@@ -5637,6 +5638,8 @@ test "HotPrefixCache: restored QSA history values match a cold feed at every pos
     for (&toks, 0..) |*t, i| t.* = @intCast(i + 1);
 
     var xfm: transformer_mod.Transformer = undefined;
+
+    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -6013,6 +6016,7 @@ test "HotPrefixCache: inherit does not clone checkpoints past donor.shared" {
     const P: usize = 20;
     const hd: c_int = 8;
     var xfm: transformer_mod.Transformer = undefined;
+    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 40, hd);
@@ -6093,6 +6097,7 @@ test "HotPrefixCache: inherit of a greedy continuation stops at the prompt" {
     const prompt_len: usize = P - 1;
     const hd: c_int = 8;
     var xfm: transformer_mod.Transformer = undefined;
+    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, 80, hd);
@@ -6149,6 +6154,7 @@ test "HotPrefixCache: sliced qsa bank apply at backoff matches the full bank at 
     const B: usize = 19;
     const H: usize = 80;
     var xfm: transformer_mod.Transformer = undefined;
+    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
     const keys = try pcQsaArangeKeys(s, @intCast(H), hd);
@@ -6244,6 +6250,7 @@ test "HotPrefixCache: heir restore at backoff matches the donor bit for bit" {
     const heir_gen: usize = 12;
     const a2_extra: usize = 8;
     var xfm: transformer_mod.Transformer = undefined;
+    xfm.rht = null;
     xfm.s = s;
     xfm.allocator = testing.allocator;
 
@@ -7157,7 +7164,8 @@ test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     const rep = hc.evictLruToAdmit(600_000, &hc, Fits.call, true);
     try t.expect(rep.admitted);
     try t.expectEqual(@as(usize, 1), rep.entries);
-    try t.expect(rep.bytes > 0);
+    // Billed bytes: the live allocator delta is not deterministic on the CI runner.
+    try t.expect(rep.accounted_bytes > 0);
 }
 test "spec adopt: a qwen4 head target declines a payload with no QSA half; KV-only targets are unaffected" {
     // The qwen4_exp head's KV is meaningless without its index-key history, so the two halves
