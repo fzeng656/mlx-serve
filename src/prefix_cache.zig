@@ -2635,16 +2635,16 @@ pub const HotPrefixCache = struct {
     /// worker arrived second.
     fn enforceCapsAfterAppend(self: *HotPrefixCache) void {
         while (self.entries.items.len > self.max_entries and self.entries.items.len > 0) {
-            self.evictOneLru("count cap", null);
+            if (!self.evictOneLruProgress("count cap", null)) break;
         }
         if (self.max_kv_bytes == 0) return;
         while (self.current_kv_bytes > self.max_kv_bytes and self.entries.items.len > 1) {
-            self.evictOneLru("byte budget", null);
+            if (!self.evictOneLruProgress("byte budget", null)) break;
         }
         // A sole oversize entry may fit after dropping optional SSM checkpoints.
         self.shedCheckpointsToFit();
         while (self.current_kv_bytes > self.max_kv_bytes and self.entries.items.len > 0) {
-            self.evictOneLru("byte budget", null);
+            if (!self.evictOneLruProgress("byte budget", null)) break;
         }
     }
 
@@ -3836,7 +3836,7 @@ test "HotPrefixCache: decode frontier wins append-only reuse and loses after div
     const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
     cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &prompt_state, 8, s);
     cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &frontier_state, 12, s);
-    _ = try hc.commitWithState(&source_cache, &committed, false, 0, cps, null, null);
+    _ = try hc.commitWithState(&source_cache, &committed, false, &.{}, cps, null, null);
 
     // Exact append-only continuation reaches the frontier: the generated tail
     // is not replayed.
@@ -3852,7 +3852,7 @@ test "HotPrefixCache: decode frontier wins append-only reuse and loses after div
         s,
         &appended,
         false,
-        0,
+        &.{},
         null,
         null,
     );
@@ -3875,7 +3875,7 @@ test "HotPrefixCache: decode frontier wins append-only reuse and loses after div
         s,
         &diverged,
         false,
-        0,
+        &.{},
         null,
         null,
     );
@@ -8971,6 +8971,8 @@ test "a restore names its entry, and a commit that extends it in place keeps the
     _ = try hc.commit(&slot, &longer, false);
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     try testing.expectEqual(id, hc.entries.items[0].id);
+}
+
 test "HotPrefixCache: equal-size workload tie protects a reused long agent session" {
     var cache = HotPrefixCache.init(testing.allocator, 8);
     defer cache.deinit();

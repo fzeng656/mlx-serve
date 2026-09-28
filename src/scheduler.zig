@@ -5525,7 +5525,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // is deliberately left on the existing path for the initial A/B.
     if (decodeFrontierCheckpointEnabled() and
         n_gen > 0 and
-        slot.vision_key == 0 and
+        slot.media.len == 0 and
         slot.ssm_entries != null and
         slot.moe_seq_offset == total_len)
     frontier_cp: {
@@ -5561,12 +5561,12 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             if (gen_ptr.frontier_terminal_id != null) "yes" else "no",
         });
     } else if (decodeFrontierCheckpointEnabled() and n_gen > 0 and slot.ssm_entries != null) {
-        log.debug("[hot-cache] decode frontier skipped (prompt={d}, generated={d}, moe_seq_offset={d}, total={d}, vision={x})\n", .{
+        log.debug("[hot-cache] decode frontier skipped (prompt={d}, generated={d}, moe_seq_offset={d}, total={d}, media_items={d})\n", .{
             slot.full_prompt.len,
             n_gen,
             slot.moe_seq_offset,
             total_len,
-            slot.vision_key,
+            slot.media.len,
         });
     }
 
@@ -7745,8 +7745,8 @@ test "hybrid decode frontier is captured only at an exact committed token positi
     try testing.expect(std.mem.indexOf(u8, body, "frontier_terminal_id") != null);
     try testing.expect(std.mem.indexOf(u8, body, "terminal_len") != null);
     try testing.expect(std.mem.indexOf(u8, body, "total_len,") != null);
-    // Initial scope excludes media so pixel-key history cannot be conflated with text continuation.
-    try testing.expect(std.mem.indexOf(u8, body, "slot.vision_key == 0") != null);
+    // Initial scope excludes media so media-span identity cannot be conflated with text continuation.
+    try testing.expect(std.mem.indexOf(u8, body, "slot.media.len == 0") != null);
 }
 
 test "a finish over a latched MLX failure ends the request as an ERROR, never a 200" {
