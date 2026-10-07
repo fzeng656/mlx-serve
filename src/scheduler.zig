@@ -3867,7 +3867,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 return error.InsufficientMemory;
             },
         }
-        }
     }
 
     // Allocate the drafter_path dupe up front so the post-publish step
