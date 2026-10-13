@@ -4993,6 +4993,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 if (slot.state == .errored or slot.cancelled.load(.acquire)) continue;
                 slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;
+                log.info("[prefill-timing] prompt={d} cached={d} elapsed_ns={d}\n", .{ slot.full_prompt.len, slot.cached_tokens, slot.prefill_ns });
                 publishFirstToken(slot);
                 if (slot.prefill_interleaved_ns > 0) log.debug("[interleave] prefill {d} ms, hosted decode {d} ms\n", .{
                     slot.prefill_ns / std.time.ns_per_ms, slot.prefill_interleaved_ns / std.time.ns_per_ms,

@@ -46,22 +46,20 @@ const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 /// commit time instead of claim time.
 pub const MIN_CANCELLED_COMMIT_TOKENS: usize = 256;
 
+/// Enable v9 media SSD entry creation only after explicitly opted in.
+fn visionDiskEnabled() bool {
+    const val = std.c.getenv("MLX_SERVE_VISION_DISK_KV") orelse return false;
+    return std.mem.eql(u8,std.mem.sliceTo(val,0),"1");
+}
+
 /// One media item's rows in a prompt: its first placeholder row and its
 /// pixel/PCM hash. Placeholder ids are identical across items, so state at and
 /// after `start` is keyed on `key`.
-pub const MediaSpan = struct { start: u32, key: u64 };
+pub const MediaSpan = kv_disk_cache.MediaSpan;
 
 /// First position where state under two span lists can differ; maxInt when
 /// they agree. Rows before the first span that differs are text.
-pub fn mediaSharedBound(a: []const MediaSpan, b: []const MediaSpan) usize {
-    const n = @min(a.len, b.len);
-    for (a[0..n], b[0..n]) |x, y| {
-        if (x.start != y.start or x.key != y.key) return @min(x.start, y.start);
-    }
-    if (a.len > n) return a[n].start;
-    if (b.len > n) return b[n].start;
-    return std.math.maxInt(usize);
-}
+pub const mediaSharedBound = kv_disk_cache.mediaSharedBound;
 
 /// The spans whose rows lie inside `[0, len)`.
 fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
@@ -331,6 +329,7 @@ const PendingDiskFlush = struct {
     snapshot: KVCacheSnapshot,
     tokens: []u32,
     has_tools: bool,
+    media: []MediaSpan = &.{},
     ssm_cps: ?[]SSMCheckpoint = null,
     dflash: ?DflashSnap = null,
     mtp: ?DflashSnap = null,
@@ -338,6 +337,7 @@ const PendingDiskFlush = struct {
     fn deinit(self: *PendingDiskFlush, allocator: std.mem.Allocator) void {
         self.snapshot.deinit();
         allocator.free(self.tokens);
+        if (self.media.len != 0) allocator.free(self.media);
         if (self.ssm_cps) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
@@ -1143,8 +1143,8 @@ pub const HotPrefixCache = struct {
             // construction (the flush refuses entries with media). The cap is
             // load-bearing even when tokens match past it: a restored row at a
             // placeholder must come from the vision splice, never from disk.
-            const disk_limit: u32 = @intCast(@min(firstSpanStart(media) orelse prompt_ids.len, prompt_ids.len));
-            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse {
+            const disk_limit: u32 = @intCast(prompt_ids.len);
+            const dm = d.bestMatchWithMedia(prompt_ids, has_tools, target_cache.config,media) orelse {
                 // Silent no-entry misses are why a 40 GB disk tier looked
                 // dead in a live post-mortem (2026-09-07): nothing in the
                 // log ever said the tier was consulted and found nothing.
@@ -1168,7 +1168,7 @@ pub const HotPrefixCache = struct {
                     const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
                     break :blk cp.pos;
                 } else 0;
-                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, disk_limit) orelse break :disk;
+                const hm = d.bestHybridMatchWithMedia(prompt_ids, has_tools, target_cache.config, disk_limit,media) orelse break :disk;
                 const disk_cp = hm.cp;
                 if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
                 const sw = io_util.Stopwatch.init(d.io);
@@ -1579,8 +1579,9 @@ pub const HotPrefixCache = struct {
         var eff_media = spansBelow(media, tokens.len);
 
         // Record what the live cache holds now, before any byte-budget trim.
-        if (self.ssd_first and self.disk != null and eff_media.len == 0) {
-            self.capturePendingDisk(source_cache, tokens, has_tools, ssm_cps, dflash, mtp);
+        if (self.ssd_first and self.disk != null and
+            (eff_media.len == 0 or visionDiskEnabled())) {
+            self.capturePendingDisk(source_cache, tokens, has_tools, eff_media, ssm_cps, dflash, mtp);
         }
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
@@ -2090,6 +2091,7 @@ pub const HotPrefixCache = struct {
         source_cache: *const KVCache,
         tokens: []const u32,
         has_tools: bool,
+        media: []const MediaSpan,
         ssm_cps: ?[]SSMCheckpoint,
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
@@ -2110,6 +2112,12 @@ pub const HotPrefixCache = struct {
             },
             .has_tools = has_tools,
         };
+        if (media.len > 0) {
+            rec.media = self.allocator.dupe(MediaSpan,media) catch {
+                rec.deinit(self.allocator);
+                return;
+            };
+        }
         if (ssm_cps) |cps| {
             rec.ssm_cps = cloneCheckpointsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
         }
@@ -2312,7 +2320,8 @@ pub const HotPrefixCache = struct {
                 .head_pos_base = mm.head_pos_base,
                 .head_marks = mm.head_marks.slice(),
             } else null;
-            const ok = d.appendCommitWithSpec(
+            const ok = (if (pending.media.len > 0 and visionDiskEnabled())
+                d.appendCommitWithSpecMedia(
                 pending.snapshot.entries,
                 pending.snapshot.step,
                 pending.snapshot.config,
@@ -2322,7 +2331,11 @@ pub const HotPrefixCache = struct {
                 p_dflash,
                 p_mtp,
                 s,
-            ) catch |err| {
+                pending.media,
+            ) else d.appendCommitWithSpec(
+                pending.snapshot.entries,pending.snapshot.step,pending.snapshot.config,
+                pending.tokens,pending.has_tools,pending.ssm_cps,p_dflash,p_mtp,s,
+            )) catch |err| {
                 log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
                 return;
             };
@@ -2335,7 +2348,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items[1..]) |*e| {
             if (e.last_used > newest.last_used) newest = e;
         }
-        if (newest.media.len != 0) return;
+        if (newest.media.len != 0 and !visionDiskEnabled()) return;
         // Phase 3: hybrid entries persist their SSM checkpoints alongside the
         // KV chunks (immutable per-position s*.safetensors). The snapshot
         // arrays are refcount-shared with the RAM entry, so `appendCommit`
@@ -2346,7 +2359,8 @@ pub const HotPrefixCache = struct {
         const specs = entrySpecCommits(newest);
         const dflash_spec = specs.dflash;
         const mtp_spec = specs.mtp;
-        const complete = d.appendCommitWithSpec(
+        const complete = (if (newest.media.len > 0)
+            d.appendCommitWithSpecMedia(
             newest.snapshot.entries,
             newest.snapshot.step,
             newest.snapshot.config,
@@ -2356,7 +2370,11 @@ pub const HotPrefixCache = struct {
             dflash_spec,
             mtp_spec,
             s,
-        ) catch |err| {
+            newest.media,
+        ) else d.appendCommitWithSpec(
+            newest.snapshot.entries,newest.snapshot.step,newest.snapshot.config,
+            newest.tokens,newest.has_tools,newest.ssm_checkpoints,dflash_spec,mtp_spec,s,
+        )) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -3447,6 +3465,37 @@ test "HotPrefixCache: media spans bound the reusable prefix at the first differi
     try testing.expectEqualSlices(MediaSpan, &.{a}, hc2.entries.items[0].media);
 }
 
+test "Vision SSD media v9 identity matching" {
+    const io=std.testing.io;
+    const stream=mlx.gpuStream();
+    var tmp=std.testing.tmpDir(.{.iterate=true});defer tmp.cleanup();
+    var path: [512]u8=undefined;
+    const len=try tmp.dir.realPath(io,&path);
+    var toks: [640]u32=undefined;
+    for (&toks,0..) |*t,i| t.*=@intCast(i+7);
+    const red=MediaSpan{.start=400,.key=0x1234abcd};
+    {
+        var disk=try kv_disk_cache.DiskTier.init(testing.allocator,io,path[0..len],"media-v9",0,128);
+        defer disk.deinit();
+        var cache=try KVCache.init(testing.allocator,2);defer cache.deinit();
+        try testFillCache(&cache,stream,2,toks.len);
+        const result=try disk.appendCommitWithSpecMedia(cache.entries,cache.step,cache.config,
+            &toks,false,null,null,null,stream,&.{red});
+        try testing.expect(result==.persisted);
+    }
+    {
+        var disk=try kv_disk_cache.DiskTier.init(testing.allocator,io,path[0..len],"media-v9",0,128);
+        defer disk.deinit();
+        try testing.expectEqual(@as(usize,1),disk.entryCount());
+        const q=disk.entries.items[0].quant;
+        try testing.expectEqual(@as(u32,640),
+            disk.bestMatchWithMedia(&toks,false,q,&.{red}).?.usable);
+        try testing.expectEqual(@as(u32,400),
+            disk.bestMatchWithMedia(&toks,false,q,&.{.{.start=400,.key=0x5555}}).?.usable);
+        try testing.expectEqual(@as(u32,400),
+            disk.bestMatchWithMedia(&toks,false,q,&.{}).?.usable);
+    }
+}
 test "HotPrefixCache: media request restores the pre-media text prefix from SSD" {
     // Live 2026-09-07: the SSD-tier lookup skipped ANY request with a
     // non-zero vision_key (`vision_key != 0 → break :disk`) — a 122k agent
